@@ -170,12 +170,25 @@ the route:
    `h2c->send_window` (e.g. via `ngx_http_v2_adjust_windows`, `ngx_http_v2.c:5043`,
    which currently looks stream-only and sign-safe)? → grep for all writers
    done; the ladder will re-check at runtime with a watchpoint.
+   **DISPOSITIONED (2026-11-20, final):** not load-bearing — the
+   demonstrated inflation route (wake 6's charge→WU→RST interleave) is
+   entirely inside `src/http/v2/`, and the writer grep found no other
+   credit site. The runtime watchpoint sweep was never run, so "no second
+   path exists" remains UNVERIFIED; no claim in this report depends on it.
 3. The queue-ordering change (`queue_position` refactor): 1.31.8's
    `ngx_http_v2_stream_precedes` returns true for a stream compared with
-   itself (`id <= id`, `ngx_http_v2.h:260`), so per-frame re-scanning seems to
-   place successive same-stream frames at the same slot — the on-wire order
+   itself (`id <= id`, `ngx_http_v2.h:260`), so per-frame re-scanning seems
+   to place successive same-stream frames at the same slot — the on-wire order
    within one `send_chain` call needs observing (`ngx_http_v2.c:538` debug
    line) before trusting my reading of it either way.
+   **DISPOSITIONED (2026-11-20, final): remains UNKNOWN and not
+   load-bearing.** The preserved logs carry thousands of `http2 frame out`
+   debug lines (`v2.c:537`), but same-stream body order cannot be read from
+   them — equal frame lengths, opaque frame pointers — and no claim in this
+   report depends on within-call frame order: the refund loop unlinks by
+   stream membership, not queue position, and the rung-3 consumer is
+   per-frame. Answering it would need a probe serving distinguishable
+   per-chunk body content and a client that checks reassembly order.
 4. Where, if anywhere, does an over-credited window become a memory-safety
    fault (allocation sized by a window, or a size_t wrap consumed by a
    length)? **ANSWERED (wake 7): at `h2c->send_window >= 2^63` exactly** —
@@ -262,6 +275,9 @@ run (max observed 2,147,483,647 after W1, 2,141,716,479 after the final WU),
 so the 1.31.8 guard never underflowed — the original NGINX2Root refund
 narrative stays refuted. No crash, no ASan report, no corruption: the ladder
 does not move past rung 1 + the observed accounting violation.
+*(Snapshot of wake 4's runs only, superseded as a ladder statement: wake 6
+later drove `send_window` past MAX and underflowed the guard — see
+"WU-interleave double-credit".)*
 
 ## Cancellation refund measurement (wake 5, 2026-11-20 — rung 2.5 evidence)
 
@@ -313,6 +329,11 @@ Combined with wake 4 (the refund never inflated `send_window`, and the
 observed over-credit is the queued-DATA shape the 1.31.9 guard closes), the
 CVE's claimed mechanism has no observed support on either ledger: neither
 the refund path nor the WU-guard path drives `h2c->send_window` past MAX.
+*(Snapshot of wake 5's runs only, superseded as a verdict: the missing
+ingredient was a connection WU interleaved between a stream's queue-time
+charge and its RST, which wake-5 probes never sent — wake 6 confirmed the
+ledger state NGINX2Root claims; see the causal-analysis correction and
+"WU-interleave double-credit". The 1:1 refund observation itself stands.)*
 
 Negative results preserved from this wake: my own postponement model
 (refund unreachable while blocked) — falsified by the REFUND hits; probe bug
@@ -390,6 +411,12 @@ so the 2^63 ledger of the rung-3 chain
 remains debugger-forced — but the wire path to it is now exercised to
 10^13, shrinking the debugger's role from "creates the ledger" to "skips
 the last ~922,000x of pumping". Rung 3 is unchanged; rung 4 remains NO.
+Measured pace of the preserved run: all 4693 credits fall inside the
+worker log's 49-second span (`wu-1.31.8-1e13-author.log`, 05:41:31 →
+05:42:20) — ≥ ~96 WU/s under gdb observation, so the remaining ~2^32-WU
+stretch is over a year of grinding at that pace even before its ~56 GB of
+wire traffic; the debugger's compression of that stretch is what makes the
+2^63 ledger reachable in this lab at all.
 
 **Control (1.31.9, identical probe):** the very first cycle WU is refused —
 "client violated connection flow control: received WINDOW_UPDATE frame
@@ -412,6 +439,11 @@ checks), and the ASan soak over the fully-inflated state stayed clean.
 Rungs 3-4 remain unfounded; on this 64-bit ASan build the demonstrated
 impact is a protocol-enforcement failure (unbounded over-credit), not
 memory corruption.
+*(Snapshot of wake 6 only, superseded as a ladder statement: wake 7 found
+the exact consumer threshold at 2^63 — a cast boundary this static sweep's
+"no consumer" conclusion missed below 2^63 — and observed the heap buffer
+overflow; see "Extreme-window consumer". The soak negative below 2^63
+stands.)*
 
 **Wake-6 falsified models, preserved:**
 
