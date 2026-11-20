@@ -11,7 +11,7 @@
 # Kill the whole tree with:  kill -TERM -- -<runner_pid>   (setsid makes
 # the runner its own process-group leader; its pid is in the .status file).
 set -u
-BUILD="${1:?usage: run-wupump.sh BUILD TOTAL_WUS TRIGGER [MARKER] [CAP_S]}"
+BUILD="${1:?usage: run-wupump.sh BUILD TOTAL TRIGGER [MARKER] [CAP_S] [INTERLEAVE]}"
 TOTAL="${2:?total WUs}"
 TRIGGER="${3:?0|1}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -23,9 +23,13 @@ JSONL="$ROOT/lab/logs/wupump-$BUILD.jsonl"
 STATUS="$ROOT/lab/logs/wupump-$BUILD.status"
 STDERR="$ROOT/lab/tmp/wupump-stderr-$BUILD.log"
 CLIENT_ERR="$ROOT/lab/tmp/wupump-client-$BUILD.err"
-rm -f "$JSONL" "$STATUS" "$ROOT/lab/logs/pump-error.log" \
-      "$STDERR" "$CLIENT_ERR" \
-      "$ROOT/lab/tmp/wupump-error-$BUILD.log"
+# rotate prior-run evidence instead of deleting it (one generation back;
+# a pump run's artifacts must survive the next run's launch)
+for f in "$JSONL" "$STATUS" "$ROOT/lab/logs/pump-error.log" \
+         "$STDERR" "$CLIENT_ERR" \
+         "$ROOT/lab/tmp/wupump-error-$BUILD.log"; do
+    [ -f "$f" ] && mv -f "$f" "$f.prev" || true
+done
 
 if nc -z 127.0.0.1 8443 2>/dev/null; then
     echo "port 8443 is already in use; kill the stale worker first" >&2
@@ -58,7 +62,7 @@ while ! nc -z 127.0.0.1 8443 2>/dev/null; do
     sleep 0.2
 done
 
-python3 "$ROOT/lab/harness/wupump.py" "$TOTAL" "$TRIGGER" "${4:-}" "${5:-}" \
+python3 "$ROOT/lab/harness/wupump.py" "$TOTAL" "$TRIGGER" "${4:-}" "${5:-}" "${6:-}" \
     >"$JSONL" 2>"$CLIENT_ERR"
 RC=$?
 

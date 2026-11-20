@@ -1,23 +1,23 @@
 # NGINX2Root / CVE-2026-123007 — nginx HTTP/2 flow-control investigation
 
-Status: **rung 3 reached (debugger-assisted): the over-credited connection
-window becomes a confirmed heap buffer overflow.** At
-`h2c->send_window >= 2^63` the queue-time limit cast in
-`ngx_http_v2_send_chain` goes negative, a DATA frame body is built from a
-wrapped ~2^63-byte length, and the SSL send chain `memcpy`s `2^63 + 2^32`
-bytes into a 16 KiB heap buffer — ASan report, worker abort (rung 3
-below; independently reproduced by the witness from a clean checkout,
-and on an unsanitized build the same probe makes the raw glibc memcpy
-execute and SIGSEGV the worker). The ledger state feeding it is
-wire-proven unbounded past MAX (rung 2.75: interleave double-credit, guard
-underflow, patched build refuses the same sequence) and wire-pumped to
-10,002,978,926,030 ≈ 4658x MAX with no debugger involvement; the final
-jump from there to 2^63 was forced in gdb (~2^32 more max-WUs, ≈ 56 GB
-of client traffic — the order of magnitude NGINX2Root claims for its
-full `--exploit`). Every
-claim is either cited to `file:line` in the extracted 1.31.8 tree, backed
-by observed worker bytes (log lines / gdb memory reads), or marked
-UNKNOWN.
+Status: **rung 3 reached, WIRE-PURE end to end: the over-credited
+connection window becomes a confirmed heap buffer overflow with no
+debugger anywhere in the loop.** The 1.31.8 guard is wire-driven past
+MAX (rung 2.75: interleave double-credit, guard underflow, patched
+build refuses the same sequence), the ledger is then wire-pumped over
+the full ~2^32 max-WU stretch — `h2c->send_window = 2^63 +
+2,189,294,763,006` (crash-observed), ~55.8 GB of loopback client
+traffic plus ~9.4 GB of interleaved server responses (see "Stage B —
+wire-pure pump to 2^63") — and a fresh GET makes the queue-time limit
+cast in `ngx_http_v2_send_chain` go negative, a DATA frame body built
+from the wrapped ~2^63-byte length, and the SSL send chain `memcpy`
+both ranges `0x800001fdbc22fbfe` bytes into/ out of 16/32 KiB heap
+buffers — ASan report, worker abort. The pre-wire-20 form of rung 3
+(ledger forced in gdb to exactly `2^63 + 2^32`, identical consumer
+chain) is preserved below as the breakpoint-observed record of the
+cast/shadow/charge chain. Every claim is either cited to `file:line`
+in the extracted 1.31.8 tree, backed by observed worker bytes (log
+lines / ASan report), or marked UNKNOWN.
 
 ## Scope and method
 
@@ -417,6 +417,105 @@ worker log's 49-second span (`wu-1.31.8-1e13-author.log`, 05:41:31 →
 stretch is over a year of grinding at that pace even before its ~56 GB of
 wire traffic; the debugger's compression of that stretch is what makes the
 2^63 ledger reachable in this lab at all.
+
+### Stage B — wire-pure pump to 2^63 (wake 20, 2026-11-20; owner DM #59)
+
+Harness (committed): `lab/harness/wupump.py` + `lab/harness/run-wupump.sh`
+against `lab/conf/nginx-h2-pump.conf` (identical server shape,
+`error_log … info` — per-frame debug would write ~4.3e9 lines, info
+keeps the anomaly lines visible). The client's bootstrap is
+byte-identical to `wuprobe.py` phases 0/A/B/C (same sleeps, same
+ledger arithmetic, ending at the proven mkC2 state R_C2 =
+4,295,065,598); from there the bulk pump pipelines standalone
+max-increment connection WUs (13 B each) in 8 MiB batches with no
+sleeps, single-threaded non-blocking select (no reader thread: a
+reader plus a writer sharing one SSL object is a race class), and the
+pump drains from mkC2 onward — safe only from that point: the live
+charge sources are the blob responses, bounded (145 × 64 MiB ≈ 9.4 GB,
+~1e-9 of the pumped ledger). Marker PINGs every 2^28 WUs; every PONG
+proves the worker parsed and accepted every frame before the marker.
+No debugger attaches at any point.
+
+**New obstacle found first — nginx's anti-flood guard.** A naive
+WU-only flood trips `total_bytes/8 > payload_bytes + 1 MiB`
+(`v2.c:432`): WUs add 13 total_bytes but 0 payload_bytes, so the pump
+dies at **37,743,324 WUs** (ledger ≈ 8.1e16) with
+"http2 flood detected" + GOAWAY(NO_ERROR) — observed on the ASan
+build, 08:18:29Z, preserved in the run-1 error-log rotation. But
+`payload_bytes` also counts SERVER-SENT frame lengths at send
+completion (`filter:1538`/`1633` DATA/HEADERS handlers, `v2.c:4095`
+request bytes), which cost no total_bytes — so the client interleaves a
+fresh `GET /blob` per 30M WUs and drains it fully: each 64 MiB blob
+buys 8 × 64 MiB = 512 MB of client-wire headroom against 390 MB spent
+per cycle. 144 cycles; sustained pace ~19–20M WU/s (≈250 MB/s of
+client wire; the wake-9 "over a year of grinding" conclusion measured
+the gdb-observed interactive harness, not the wire limit, and is
+superseded).
+
+**Boundary negative (run 1, N = 2^32 + 4):** the full pump completes
+(all 16 marker PONGs, end-marker PONG, no GOAWAY, no flood line), but
+the 145 × 64 MiB blob drain charges eat the margin: ledger at trigger
+≈ 2^63 − 1.2e9, and the trigger GET streams a normal 64 MiB response
+with the worker clean — the consumer does NOT fire below the cast
+boundary, wire-pure, matching the exact-threshold claim from below.
+(Run-1's archived logs were rotated away by the launcher's original
+`rm`; the runner now rotates one generation back. The done line's
+`dead: null` at emit time fixes `triggered: false` regardless of the
+truncated display.)
+
+**Wire-pure rung 3 (run 2, N = 2^32 + 1024, ASan build):** full pump
+in 231.7 s — 4,294,968,320 WUs sent, 144 interleave blobs drained
+(9,730,785,280 B), zero flood lines, every marker PONGed. Trigger GET
+on the next unused odd stream id (361) kills the worker immediately:
+client sees EOF with no GOAWAY; worker log shows exit code 1 at the
+same second; the full ASan report (archived at
+`lab/tmp/wupump-error-1.31.8-run2-asan.log`, md5
+`beca54a652c68081e88d7bdb67a8758a`; client JSONL
+`lab/tmp/wupump-1.31.8-run2.jsonl`, md5
+`3ff884c724d5dbaf6940fafa6a8bd503`) reads
+`memcpy-param-overlap: memory ranges [0x52900307f28e,0x8000548dbf2aee8c)
+and [0x52d0002c6400,0x800054cdbc4f5ffe)` — both ranges exactly
+**9,223,374,226,149,538,814 = 0x800001fdbc22fbfe = 2^63 +
+2,189,294,763,006 bytes**, destination 0 bytes after the 16,384-byte
+SSL buffer region (its fill point), call chain identical to the
+gdb-forced rung-3: static handler → copy filter →
+`ngx_http_v2_send_chain` (`filter:1274`) → `send_output_queue`
+(`v2.c:544`) → `ngx_ssl_send_chain` (`ngx_event_openssl.c:3150`).
+The crash-observed wrapped length equals the client-side ledger
+arithmetic `R_C2 + N × (2^31−1) − drained` plus exactly 2,195,456 B
+(67 × 32 KiB) — the initial blob burst charge already inside wake-9's
+observed R_C2, which the client model double-subtracts: the pump
+arithmetic and the worker's own bytes agree to the identified chunk.
+Wire volume: ~55.8 GB of client WU traffic plus ~9.4 GB of interleaved
+server responses — the order of magnitude NGINX2Root claims (~119 GiB)
+for its full `--exploit` (consistency, not proof).
+
+Ladder meaning: the 2^63 ledger is now reached by wire alone; the
+rung-3 trigger (rung 3 = confirmed memory corruption) fires wire-pure
+on the ASan build. This makes NO rung-4 claim — content/placement
+control remains unproven and the Stage-A survey's zero-store wall
+stands (see rung 4 row).
+
+**Plain build (run 3, N = 2^32 + 1024, unsanitized):** the same pump
+runs 3.8x faster (~74M WU/s send pace, 69.8 s total) and the consumer
+fires WITHOUT the explicit trigger GET: while the final batch was
+still in flight the ledger crossed 2^63 mid-cycle-144, the last
+interleave blob's own `send_chain` (36 MB of its 64 MB still
+undelivered) hit the cast, and the worker died at 08:37:05Z with the
+master logging `[alert] worker process 3256602 exited on signal 11
+(core dumped)` (archived log + client JSONL preserved as
+`lab/tmp/wupump-error-1.31.8-plain-run3.log` /
+`lab/tmp/wupump-1.31.8-plain-run3.jsonl`, md5s `bed7c6238b7c84dcbc793f66599d05b6`
+/ `1a4f17c08fc91d4e6124517afd1f01da`). Client side: full count sent,
+`dead: "eof"`, no GOAWAY, ledger est at crash ≈ 2^63 + 2.19e12. So on
+the plain build the wire-pure firing is even more general than the
+designed trigger: ANY response stream whose DATA queues after the
+ledger passes the cast boundary becomes the consumer. The run's fault
+context (registers/memcpy length) is NOT observed on the wire-pure
+plain run itself — no core survived (apport rate-limiting for
+unpackaged binaries) — the mechanism is corroborated by the ASan
+twin's byte-identical chain and the historical forced-ledger plain
+runs (witness 3/3 + author 1/1).
 
 **Control (1.31.9, identical probe):** the very first cycle WU is refused —
 "client violated connection flow control: received WINDOW_UPDATE frame
@@ -999,6 +1098,20 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
    `xgroom-verify.py` check grades the spray geometry, the chosen-byte
    replacement and the surviving victims past the stored extent.
 
+9. **Stage B — wire-pure pump to 2^63 — DONE as a wire-pure POSITIVE:
+   see "Stage B".** Reproduce from a clean checkout:
+   `lab/harness/run-wupump.sh 1.31.8 4294968320 1 268435456 21600 1`
+   (~5 min): bootstrap identical to `run-wu.sh`, then the bulk
+   pipelined max-WU pump with the blob interleave that feeds nginx's
+   anti-flood guard, ending with the wire-pure trigger GET — expect
+   `triggered: true` in the client JSON and the ASan
+   `memcpy-param-overlap` report with both ranges `0x800001fdbc22fbfe`
+   in the archived worker log. Two deterministic companions:
+   `… 50000000 0 1000000 600 0` reproduces the naive flood-guard wall
+   (abort at ~37.7M WUs, "http2 flood detected"), and
+   `… 4294967300 1 268435456 21600 1` reproduces the boundary negative
+   (full pump, no crash: ledger ≈ 2^63 − 1.2e9 at the trigger).
+
 ## Evidence ledger
 
 | Ladder rung | Status | Evidence |
@@ -1007,9 +1120,9 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
 | Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
 | Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 = 4658x MAX + 98,304, all 4693 credits accepted, author 1/1 + witness 1/1 (the earlier "2/2" was one run under two byte-identical log files, same worker PID 566660; witness run PID 624758), worker clean under ASan (`gdb-wu-1.31.8-1e13.log`, witness log `gdb-wu-1.31.8-4656-witness.log`) |
-| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
-| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level; route records witness-CONFIRMED under their own fetches, DM #58): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
+| Reproducible crash (ledger debugger-forced in wake 7; wire-pumped since wake 20) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`). Wake 20: the same crash reached WIRE-PURE — run 2 of "Stage B" (N = 2^32+1024, no debugger anywhere in the loop) pumps the ledger over the full ~2^32-WU stretch and the trigger GET aborts the worker (exit 1, ASan memcpy ranges `0x800001fdbc22fbfe`); on the plain build the consumer fires wire-pure mid-pump, no trigger GET needed (`worker exited on signal 11` once the ledger crosses 2^63 with a live response stream — run 3, "Stage B") |
+| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer. Wake 20: confirmed WIRE-PURE — ledger wire-pumped to `2^63 + 2,189,294,763,006` (crash-observed wrapped length, agreeing with the pump arithmetic to the identified 2,195,456-byte double-counted burst charge), ASan memcpy-param-overlap with both ranges `0x800001fdbc22fbfe` into the 16 KiB SSL buffer — see "Stage B" |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger is now WIRE-PUMPED (wake 20, "Stage B") — rung 4 stays NO for content/placement reasons: Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level; route records witness-CONFIRMED under their own fetches, DM #58): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump) RUN (owner DM #59, wake 20):** the ledger is wire-pumped to `2^63 + 2.19e12` and the rung-3 trigger fires wire-pure (see "Stage B"); rung 4 stays NO — Stage C's consumer has no write to hijack on any build this lab can execute (the zero-store wall above), so a wire-pure ledger does not by itself move rung 4 |
 | Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half, witness-confirmed (DM #51) | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary — see "Stage-A-mechanics" |
 | Stage-A-mechanics grooming slice (SYNTHETIC, owner #47 + standing approval item 1; NOT a rung-4 claim) | mechanics POSITIVE, grooming half, witness-confirmed | wake 16, witness 2/2 (DM #53; amendment verified DM #55): `/canary`-sprayed victims occupy 87% of the victims window at computable, run-stable offsets (byte-exact per-chunk maps `canary_off = win_off + K`, identical across 3 author runs + 2 witness runs); the store-first copy replaces them with byte-exact chosen blob bytes below its 118,784-byte stored extent, zero canary magic surviving inside it, and content-valid sprayed victims survive past the extent; run-varying bytes confined to a ~16 KiB nginx-interleaved buffer between the sprayed spans — see "Stage-A-mechanics grooming slice" |
 
