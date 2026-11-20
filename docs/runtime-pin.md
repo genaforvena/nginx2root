@@ -1,4 +1,4 @@
-# Runtime pin and its two local changes
+# Runtime pin and its local changes
 
 This plant does not contain Mishe source. Its minds run from a pinned release
 snapshot in `.mishe-tauftauf/releases/<sha>/` (gitignored, like all site
@@ -10,7 +10,7 @@ committed snapshot, never from a live checkout.
 - Base: commit `0d686bba` (`budget-json-contract: budget and budget-consistency
   resolve to steward`) of the upstream mishe-tauftauf repository, copied
   verbatim from that repository's own pinned release directory on 2026-11-20.
-- The snapshot is a fork with exactly two file changes, both recorded here so
+- The snapshot is a fork with exactly three file changes, all recorded here so
   anyone can rebuild the pin from the base commit:
 
 ### 1. Unit marker (`src/mishe_tauftauf/units.py`)
@@ -37,9 +37,28 @@ repository's own `duties.json` is kept identical to the snapshot's copy so
 `runtime_source` (which prefers the runtime's manifest) and a reader of the
 repository see the same set.
 
+### 3. Started-unit names (`src/mishe_tauftauf/wake.py`, `src/mishe_tauftauf/arm.py`)
+
+```diff
+- "systemctl", "--user", "start", "--no-block", f"mishe-wake@{role}.service"]
++ "systemctl", "--user", "start", "--no-block", f"nginx2root-wake@{role}.service"]
+-TIMER_UNIT = "mishe-next-due"
++TIMER_UNIT = "nginx2root-next-due"
+```
+
+Why: upstream assumes one plant per host and hardcodes its own unit-name
+prefix when it *asks systemd to start* units. With a second plant present,
+that literal asked systemd to instantiate the main plant's
+`mishe-wake@.service` template with a foreign role — the main plant's
+dispatcher correctly refused ("role not declared"), but the request still
+started its units three times and wrote foreign keys (`phpsec`, `nginxsec`)
+into its wake-start ledger. The plant prefix must appear here too, or the
+plants are not actually separate. Both foreign ledger keys were removed from
+the main plant's state after the incident; its doctor was GREEN throughout.
+
 ## Consequences
 
-- Upgrades mean: take a newer upstream release snapshot, re-apply the two
+- Upgrades mean: take a newer upstream release snapshot, re-apply the three
   changes above, re-point `runtime/current`, run `mishe sync`, and check
   `mishe doctor` exits 0 before releasing the hold.
 - Host containment still applies: the hand-written prefix drop-in
