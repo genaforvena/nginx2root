@@ -577,6 +577,84 @@ the .9 differential is rung 2.75's.
    command-list body and exit 0 after three breakpoints with no `run` —
    no error text. Diagnosis cost one runner attempt; the runner's
    port-wait timeout surfaced it.
+
+## Stage-A survey: the wrapped memcpy writes NOTHING before dying (wake 14, 2026-11-20 — rung-4 pursuit, negative)
+
+The owner-directed rung-4 Stage A premise ("convert the blind 2^63 memcpy
+into a controlled write" by grooming victims adjacent to the 16 KiB SSL
+buffer and letting the partial copy overwrite them) is FALSIFIED on this
+lab's glibc: the huge memcpy performs ZERO stores before faulting.
+
+Harness: `lab/harness/run-x-survey.sh 1.31.8-plain` +
+`lab/harness/gdb-x-survey.cmd` — the same forced-ledger probe as
+`run-x-plain.sh`, with the fault context captured at the SIGSEGV stop
+(`lab/tmp/gdb-x-survey-1.31.8-plain.log`; the conditional breakpoint meant
+to dump the heap pre-state never fired on this -O1 build — its
+`file:line if size < 0` form resolves to a location where `size` is
+unavailable, a harness defect to fix before any future dump-based
+experiment — but the stop-time capture alone settles the question).
+
+**Observed (1 run, complete register cross-check):** fault at
+`__memcpy_avx_unaligned_erms+363` = `vmovdqu -0x20(%rsi,%rdx,1),%ymm5`,
+a TAIL-VEC **load** from `src + n - 0x20`; with the wrapped
+`n = 2^63 + 2^32` and a heap src this address has bit 63 set →
+non-canonical → #GP → SIGSEGV with `si_code = 128 (SI_KERNEL)` and
+`si_addr = 0` (kernel cannot encode a non-canonical fault address) — both
+observed. Disassembly of the taken path (libc file offset 0x188d80,
+Ubuntu glibc 2.39-0ubuntu8.12; runtime base 0x7ffff7400000 = fault RIP
+0x7ffff7588eeb − file offset 0x188eeb):
+
+```
+188d8d  vmovdqu (%rsi),%ymm0        head-VEC LOAD (valid heap) — succeeds
+188e40  cmp [non_temporal_threshold],%rdx ; ja 189040        taken (n huge)
+189040  mov %rdi,%rcx ; sub %rsi,%rcx ; cmp %rdx,%rcx ; jb  not taken
+18904f  mov %rdi,%r8                                       r8 = dst (observed)
+189052  cmp [rep_movsb_threshold],%rdx ; jae 1890a0         taken
+1890a0  mov [0x20b230],%r11 ; cmp %r11,%rdx ; jb            not taken
+        (r11 = 0x1800000 = 24 MB shared-cached-size, observed)
+1890b0  neg %rcx                    rcx = src - dst = 0x2abae6 (observed)
+1890b3  cmp %rcx,%rdx ; ja 188eeb   taken (n > src-dst)
+188eeb  vmovdqu -0x20(%rsi,%rdx,1),%ymm5   FAULT — first unmapped access
+```
+
+Every register the trace predicts matches the observed stop state
+(`r8 = 0x5555557799ca = dst`, `rcx = 0x2abae6 = src − dst`,
+`r11 = 0x1800000`, `rdx = n` unchanged). The path contains exactly two
+memory accesses: one valid head load and the faulting tail load. No store
+instruction executes. Consequences:
+
+1. **The "partial copy before the fault" window on this build is ZERO
+   bytes** — the plain-build worker death (rung 3's 4/4 SIGSEGV) is a
+   tail-VEC LOAD fault, not a progressive overwrite; the heap is never
+   written by the wrapped memcpy. This refines (does not revoke) rung 3:
+   the OOB write is the ASan-observed call (ASan rejects the huge ranges
+   before execution), while the unsanitized build dies before its first
+   store.
+2. **No survivable wrapped length exists on this build.** Any negative
+   `ssize_t` size converts to a `size_t ≥ 2^63`; for any canonical user
+   src, `src + n` is non-canonical, and glibc's tail-first access hits it
+   before the main loop. The owner's open question "whether a smaller
+   survivable wrapped length can be shaped" is answered NO for this
+   glibc/hardware combination — not by calibration but structurally.
+3. **Stage A as specified (canary adjacent to the SSL buffer receiving
+   chosen bytes from the partial copy) is unreachable via this consumer
+   on this build.** Placement control has no write to land. The owner's
+   named obstacle ("the 2^63 overshoot may fault before a useful object
+   executes") is now an observed wall, not a risk.
+
+Per-build caveat, honestly labeled: this host is AMD Zen 3 (AVX2 only),
+so the IFUNC dispatcher selects `__memcpy_avx_unaligned_erms`; NGINX2Root's
+claimed profile is Debian 13, glibc 2.41, AVX-512 target. Whether the
+glibc 2.41 `__memmove_avx512_unaligned_erms` path orders its accesses
+differently (e.g. stores the head VEC before the tail load) is UNVERIFIED
+[INFERENCE from the shared template: likely the same tail-first order];
+checking it is the next Stage-A step. All rung-4 claims remain labeled for
+this lab's 1.31.8-plain build only.
+
+**Wake-14 falsified model, preserved:** "the raw glibc memcpy runs forward
+until it hits an unmapped page, overwriting everything between" — FALSE on
+this build: it faults on its second access, a wrapped-address tail load,
+having written nothing.
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
@@ -609,6 +687,11 @@ the .9 differential is rung 2.75's.
 5. **Control:** DONE — 1.31.9 rejects the over-credit probe (wake 4) and
    the interleave probe (wake 6) at the guard (`v2.c:2564/2565`, with
    `- h2c->send_queued` in the .9 guard).
+6. **Stage-A survey (rung 4 pursuit) — DONE as a NEGATIVE: see "Stage-A
+   survey".** `lab/harness/run-x-survey.sh 1.31.8-plain` captures the
+   fault context of the wrapped memcpy: glibc's tail-VEC load from the
+   wrapped non-canonical `src + n - 0x20` faults before any store, so the
+   "partial copy" window is zero bytes on this build.
 
 ## Evidence ledger
 
@@ -620,12 +703,13 @@ the .9 differential is rung 2.75's.
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 = 4658x MAX + 98,304, all 4693 credits accepted, author 1/1 + witness 1/1 (the earlier "2/2" was one run under two byte-identical log files, same worker PID 566660; witness run PID 624758), worker clean under ASan (`gdb-wu-1.31.8-1e13.log`, witness log `gdb-wu-1.31.8-4656-witness.log`) |
 | Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63) |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware; glibc 2.41 AVX-512 path UNVERIFIED |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
 interleave finding of wake 6), the three falsified queueing models in
 "Falsified models", the wake-6 falsified models in the rung-2.75 section, the
-wake-6 "no threshold on paper" model killed at 2^63 (rung-3 section), and
+wake-6 "no threshold on paper" model killed at 2^63 (rung-3 section), the
+wake-14 "progressive forward overwrite" model (Stage-A survey), and
 the upstream-commit cross-check (witness-verified: six-line match, tag diff
 a superset — see "The patch").
