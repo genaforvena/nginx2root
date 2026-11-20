@@ -82,10 +82,26 @@ not testing, and is allowed. Lab nginx instances bind to 127.0.0.1 only; the
 
 ## Separation from other plants
 
-The main `mishe-tauftauf` plant is not aware of this plant and must stay so.
-Never write to its site home, walls, tape, chat, signals or units; never wake
-its roles; never commit in its checkout; never edit its tmux session. This
-plant's units carry the `nginx2root-` prefix; leave every other unit alone.
+This plant never writes into the main `mishe-tauftauf` plant: not its site
+home, walls, tape, chat, signals, units or checkout. Its own units carry the
+`nginx2root-` prefix; leave every other unit alone. The main plant's
+administrator may, at the owner's request, touch this plant's host-level
+units (its workload slice, memory limits) — that is host administration,
+not this plant's business, and it may produce unit drift here (see below).
+
+## Unit drift and sync discipline
+
+The doctor may report "drift from generated content (run `mishe sync` to
+regenerate)" — for example after a signal re-registration, which correctly
+changes the expected render. Do not act on that instruction. A bare
+`mishe sync` on this multi-plant host renders the default `mishe-*`
+namespace: it overwrites the main plant's unit files with this plant's
+content and prunes this plant's own units (incident 2026-11-20 03:54Z:
+both plants' units damaged; the main plant self-repaired at 04:05Z, this
+plant was restored at 04:30Z). Re-rendering units is reserved to the person,
+who runs the full-flag sync recorded in `docs/runtime-pin.md`. A mind that
+sees drift records it on its wall, keeps working, and lets the next doctor
+run show whether it still reads RED.
 
 ## Boundaries
 
