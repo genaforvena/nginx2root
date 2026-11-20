@@ -149,13 +149,16 @@ def main():
     tls.sendall(ping(b"mkC2ping"))                    # C2: post-BIG_WU state
 
     # ---- phase C2a (optional soak): extra BIG_WUs, each must be accepted;
-    # argv[2] = count, default 0. Drive send_window into the 10^10 range
-    # and flush the whole blob through the inflated-window path.
+    # argv[2] = count, default 0. Drive send_window as far as the caller
+    # asks (wake 6 used 4 -> 6x MAX ~1.29e10; 4656 -> ~1e13) and flush the
+    # blob through the inflated-window path. Frames are identical to phase
+    # C's; batching 64 per sendall is pacing only.
     soak = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else 0
     if soak:
-        for _ in range(soak):
-            tls.sendall(window_update(0, BIG_WU))
-            time.sleep(0.2)
+        batch = 64
+        for i in range(0, soak, batch):
+            tls.sendall(window_update(0, BIG_WU) * min(batch, soak - i))
+            time.sleep(0.1)
         tls.sendall(ping(b"mkS9ping"))
         result.setdefault("markers", []).append("mkS9ping")
         result["soak"] = soak

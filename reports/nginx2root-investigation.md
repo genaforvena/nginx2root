@@ -10,9 +10,11 @@ below; independently reproduced by the witness from a clean checkout,
 and on an unsanitized build the same probe makes the raw glibc memcpy
 execute and SIGSEGV the worker). The ledger state feeding it is
 wire-proven unbounded past MAX (rung 2.75: interleave double-credit, guard
-underflow, patched build refuses the same sequence); the jump from there
-to 2^63 was forced in gdb, not wire-pumped (~56 GB of client traffic,
-the order of magnitude NGINX2Root claims for its full `--exploit`). Every
+underflow, patched build refuses the same sequence) and wire-pumped to
+10,002,978,926,030 ≈ 4657x MAX with no debugger involvement; the final
+jump from there to 2^63 was forced in gdb (~2^32 more max-WUs, ≈ 56 GB
+of client traffic — the order of magnitude NGINX2Root claims for its
+full `--exploit`). Every
 claim is either cited to `file:line` in the extracted 1.31.8 tree, backed
 by observed worker bytes (log lines / gdb memory reads), or marked
 UNKNOWN.
@@ -368,6 +370,22 @@ GOAWAY, no EOF, all 8 PING markers answered, and **zero ASan/UBSan reports**
 beyond the pre-existing benign misaligned-store noise. The client had pushed
 cumulative accepted WU increments of ~12.9 GB through a 2^31-1 ceiling.
 
+**Wake-9 extension (wire-only pump to 10^13):** the same harness with
+`run-wu.sh 1.31.8 4656` — `wuprobe.py` phase C2a batches the WU sends,
+frames byte-identical to phase C's — drove `send_window` to
+**10,002,978,926,030 ≈ 1.0e13 ≈ 4657x MAX** (mkS9, preserved log
+`lab/tmp/gdb-wu-1.31.8-1e13.log`: `PINGMARK
+send_window=10002978926030`; all 4693 CONNWU credits accepted;
+reproduced 2/2). No debugger forcing anywhere on this path: the
+gdb breakpoints only observe. All 8 markers answered, no GOAWAY, the
+worker exited normally under ASan, and the drain streamed 37 MB. The
+remaining gap to the 2^63 cast threshold is ~2^32 further max-WUs
+(≈ 4.3 billion, ~922,000x this run's pump, ≈ 56 GB of wire traffic),
+so the 2^63 ledger of the rung-3 chain
+remains debugger-forced — but the wire path to it is now exercised to
+10^13, shrinking the debugger's role from "creates the ledger" to "skips
+the last ~922,000x of pumping". Rung 3 is unchanged; rung 4 remains NO.
+
 **Control (1.31.9, identical probe):** the very first cycle WU is refused —
 "client violated connection flow control: received WINDOW_UPDATE frame
 with window increment 65536 not allowed for window 2147442687" (the value
@@ -499,7 +517,8 @@ deterministic client input + one debugger-forced ledger jump; 2 runs
 byte-identical + witness 3/3 + plain-build SIGSEGV 4/4). NOT rung 4: no
 control exercised over the overflow's contents or placement beyond its
 length, and the 2^63 ledger was not
-wire-pumped. The consumer code (`send_chain` limit cast, `get_shadow`,
+wire-pumped (wire-pumping reached 10^13, wake 9). The consumer code
+(`send_chain` limit cast, `get_shadow`,
 `ngx_ssl_send_chain`) is IDENTICAL in 1.31.9 — the patch fixes the guard
 and the ledger, not the consumer — so a .9 control run of this experiment
 would be meaningless (forcing the value bypasses the guard in any build);
@@ -533,9 +552,11 @@ the .9 differential is rung 2.75's.
    see rung 2.75 for what changes when one is present.
 3. **WU-interleave double-credit — DONE, see "WU-interleave double-credit
    and connection-window underflow".** `lab/harness/run-wu.sh 1.31.8`
-   (and `run-wu.sh 1.31.8 4` for the ASan soak) reproduce the full chain:
-   `send_window` past MAX, guard underflow, unbounded credit; byte-identical
-   across 2 runs. `run-wu.sh 1.31.9` reproduces the control GOAWAY.
+   (and `run-wu.sh 1.31.8 4` for the wake-6 ASan soak, `run-wu.sh
+   1.31.8 4656` for the wake-9 wire-only pump to 10^13) reproduce the
+   full chain: `send_window` past MAX, guard underflow, unbounded credit;
+   byte-identical across 2 runs. `run-wu.sh 1.31.9` reproduces the
+   control GOAWAY.
 4. **Corruption attempt (rung 3) — DONE as a POSITIVE, debugger-assisted:
    see "Extreme-window consumer".** `lab/harness/run-x.sh 1.31.8`
    reproduces the confirmed heap buffer overflow (ASan report + worker
@@ -543,8 +564,11 @@ the .9 differential is rung 2.75's.
    `2^63 + 2^32` after the wire-proven pump. `lab/harness/run-x-plain.sh`
    does the same against the unsanitized `1.31.8-plain` build: raw glibc
    memcpy executes with `__len = 2^63 + 2^32` and the worker SIGSEGVs
-   (witness 3/3 + author re-run 1/1). The wake-6 negative below 2^63
-   stands; no consumer exists between `6x MAX` and `2^63 - 1`.
+   (witness 3/3 + author re-run 1/1). The negative below 2^63 stands:
+   the wake-6 soak (6x MAX) and the wake-9 wire-only pump through
+   10^13 (4657x MAX, worker clean) both traversed the range without
+   any consumer firing; no consumer exists between `6x MAX` and
+   `2^63 - 1`.
 5. **Control:** DONE — 1.31.9 rejects the over-credit probe (wake 4) and
    the interleave probe (wake 6) at the guard (`v2.c:2564/2565`, with
    `- h2c->send_queued` in the .9 guard).
@@ -556,10 +580,10 @@ the .9 differential is rung 2.75's.
 | Suspected vulnerability | YES | patch diff + fault sites above |
 | Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
 | Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
-| **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0 |
-| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is proven to exist but was not pumped (~2^32 max-WUs) |
+| **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 ≈ 4657x MAX, all 4693 credits accepted, 2/2 runs, worker clean under ASan (`gdb-wu-1.31.8-1e13.log`) |
+| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4657x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922x short of 2^63) |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
