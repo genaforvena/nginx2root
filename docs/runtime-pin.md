@@ -10,7 +10,7 @@ committed snapshot, never from a live checkout.
 - Base: commit `0d686bba` (`budget-json-contract: budget and budget-consistency
   resolve to steward`) of the upstream mishe-tauftauf repository, copied
   verbatim from that repository's own pinned release directory on 2026-11-20.
-- The snapshot is a fork with exactly three file changes, all recorded here so
+- The snapshot is a fork with exactly four file changes, all recorded here so
   anyone can rebuild the pin from the base commit:
 
 ### 1. Unit marker (`src/mishe_tauftauf/units.py`)
@@ -56,9 +56,29 @@ into its wake-start ledger. The plant prefix must appear here too, or the
 plants are not actually separate. Both foreign ledger keys were removed from
 the main plant's state after the incident; its doctor was GREEN throughout.
 
+### 4. Promotion unit prefix (`src/mishe_tauftauf/release_promotion.py`)
+
+```diff
+-        unit_dir=Path.home()/".config/systemd/user", prefix="mishe", no_slices=False,
++        unit_dir=Path.home()/".config/systemd/user", prefix="nginx2root", no_slices=False,  # fork change 4
+```
+
+Why: `activate()` (called during promotion, not during a normal `mishe sync`)
+hardcodes the unit-name prefix. Change 1 gives these units the `nginx2root-`
+marker, but with `prefix="mishe"` promotion rendered *mishe-named* units
+carrying the foreign marker into the shared `~/.config/systemd/user`. On
+2026-11-20 03:54Z this rewrote 179 of the main plant's units and turned its
+`doctor` RED ("179 missing, 0 stale") until its 04:05Z sync restored them.
+The prefix must appear here too, or promotion re-clobbers the other plant.
+The main plant's own sync now refuses foreign-marked paths (upstream commit
+`92f11a14`), but that guard is defence in depth, not a substitute for this
+fork change. Keep the `nginx2root-plants.slice` drop-ins; undo is the one-line
+revert above plus a `daemon-reload`.
+
+
 ## Consequences
 
-- Upgrades mean: take a newer upstream release snapshot, re-apply the three
+- Upgrades mean: take a newer upstream release snapshot, re-apply the four
   changes above, re-point `runtime/current`, run `mishe sync`, and check
   `mishe doctor` exits 0 before releasing the hold.
 - Host containment still applies: the hand-written prefix drop-in
