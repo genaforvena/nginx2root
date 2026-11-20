@@ -269,6 +269,16 @@ SO_RCVBUF=8192; server sndbuf autotunes to 2.6 MB and the advertised client
 window is not enforced on this host's loopback). UBSan emits pre-existing
 benign misaligned-store reports in nginx's frame serialization
 (`v2.c:2837-2904`, `v2.c:892-897`) — not CVE-related, non-fatal.
+**Wire-pure re-observed and dispositioned (wake 20, operator DM #61):**
+the Stage B pump's worker log carries 21 recoverable UBSan reports,
+all the same class — misaligned uint16/uint32 accesses to 9-byte h2
+frame-header fields (1-mod-4 offsets), incl. the GOAWAY writer's
+stores (`v2.c:2959/2960`) and a misaligned load at `v2.c:2270` —
+preserved in `lab/tmp/wupump-error-1.31.8-run2-asan.log`; benign on
+x86-64 (unaligned accesses are architecturally defined), unrelated to
+the flow-control ledger or the wrapped-length consumer; recorded here
+rather than dropped because the wire-pure run observes them without
+any debugger in the loop.
 
 What this does NOT show: `h2c->send_window` itself never exceeded MAX in any
 run (max observed 2,147,483,647 after W1, 2,141,716,479 after the final WU),
