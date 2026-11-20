@@ -62,3 +62,29 @@ per claimed finding, committed alongside.
 4. Attempt the accounting proof first (the `--safe` equivalent); only then
    the corruption question; classify every fault on the ladder.
 5. witness re-runs everything independently.
+
+## Rung 4 pursuit (owner directive, 2026-11-20)
+
+The report stands at rung 3 (confirmed corruption) with rung 4 honestly NO.
+The owner directs the plant to pursue demonstrated security impact in
+stages, in this order:
+
+- **Stage A — placement control.** Heap-groom the lab worker (connection
+  spray, echoed buffers with chosen content near the SSL send chain) and
+  prove chosen bytes land at a chosen offset via a canary region. This
+  converts the blind 2^63 memcpy into a controlled write.
+- **Stage B — wire-pure trigger.** Build a bulk pipelined WINDOW_UPDATE
+  pump and wire-pump the ledger to 2^63 without debugger forcing
+  (~2^32 max-WUs, ~56 GB on loopback; budget hours of lab compute).
+- **Stage C — control-flow hijack.** With placement control, overwrite an
+  adjacent callback (pool cleanup handler, connection event pointer) and
+  demonstrate pointer control / a benign marker execution in the lab
+  build, ASLR disabled, honestly labeled per-build.
+
+Known obstacles to carry, not hide: the 2^63 overshoot may fault before a
+useful object executes (the exploitable window is the partial copy before
+the fault); whether a smaller survivable wrapped length can be shaped is
+open; calibration is per-build and every claim is labeled for this lab's
+1.31.8. All testing stays loopback-only. Witness re-runs each stage's
+claims exactly as before; a stage that fails is preserved as a negative
+result, not retried into existence.
