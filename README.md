@@ -14,5 +14,5 @@ corruption → demonstrated impact — and never upgraded without observed bytes
 All testing is local; nothing here contacts or scans external systems.
 
 - Task and verified ground truth: [docs/task.md](docs/task.md)
-- Report (when it exists): `reports/`
+- Report: [reports/nginx2root-investigation.md](reports/nginx2root-investigation.md) — rung 3 reached; rung 4 honestly recorded as NO
 - License: [CC0 1.0](LICENSE) — everything here is public domain.
