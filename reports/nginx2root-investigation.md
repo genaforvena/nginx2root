@@ -12,7 +12,11 @@ wire-pure pump to 2^63") — and a fresh GET makes the queue-time limit
 cast in `ngx_http_v2_send_chain` go negative, a DATA frame body built
 from the wrapped ~2^63-byte length, and the SSL send chain `memcpy`
 both ranges `0x800001fdbc22fbfe` bytes into/ out of 16/32 KiB heap
-buffers — ASan report, worker abort. The pre-wire-20 form of rung 3
+buffers — ASan report, worker abort. Stage B is independently
+reproduced: witness 3/3 from a clean checkout (DM #66, 2026-11-20) —
+naive flood wall at exactly 37,743,324 WUs, ASan trigger crash with
+both ranges machine-checked `0x800001fdbc22fbfe` and a byte-identical
+chain, plain-build mid-pump SIGSEGV. The pre-wire-20 form of rung 3
 (ledger forced in gdb to exactly `2^63 + 2^32`, identical consumer
 chain) is preserved below as the breakpoint-observed record of the
 cast/shadow/charge chain. Every claim is either cited to `file:line`
@@ -526,6 +530,44 @@ plain run itself — no core survived (apport rate-limiting for
 unpackaged binaries) — the mechanism is corroborated by the ASan
 twin's byte-identical chain and the historical forced-ledger plain
 runs (witness 3/3 + author 1/1).
+
+**Witness disposition (DM #66, 2026-11-20): CONFIRMED 3/3 under
+independent hands.** Under the operator's grant (#63, relayed as DM
+#64) the witness re-ran the whole Stage B sequence from a clean
+checkout at commit `5f37a53` — loopback only, no debugger anywhere in
+the loop, no counterexample found, no claim contradicted:
+
+1. **Naive wall:** aborted at exactly **37,743,324 WUs** (ledger est
+   8.105e16), "http2 flood detected" + GOAWAY(0) + EOF, no blobs —
+   the claimed flood-guard wall to the WU. (The recoverable UBSan
+   misaligned-store lines in its worker log are the 5f37a53-dispositioned
+   benign class.)
+2. **ASan twin of run 2:** clean pump in 229.7 s (144 blobs, drained
+   9,730,785,280 B — identical to run 2), end marker PONGed, trigger
+   GET on sid 361 → worker exit 1; the witness's own ASan report
+   (same binary, BuildId `8313ccb0…`) reads `memcpy-param-overlap`
+   with BOTH range lengths machine-checked to exactly
+   `0x800001fdbc22fbfe = 2^63 + 2,189,294,763,006`, destination 0
+   bytes past the 16,384-byte SSL buffer, chain byte-identical to
+   run 2 (static handler → copy filter → `filter:1274` → `v2.c:544` →
+   `ngx_event_openssl.c:3150`, preceded by the `filter:1307/1308`
+   pointer-overflow reports), and the witness's independent client
+   model reproduces the crash length to the byte.
+3. **Plain twin of run 3:** died mid-pump with no trigger GET (full
+   count sent, `dead:"eof"`, `triggered:false`), worker
+   `exited on signal 11 (core dumped)` at 09:00:12Z, ledger est −
+   2^63 = 2,189,332,085,758 ≈ 2.19e12 — run 3's shape exactly; as
+   recorded above, that run's own fault context stays unobserved (no
+   core survived apport) and its corroboration is the byte-identical
+   ASan twin.
+
+The witness re-verified the author's archived run-2 bytes before
+running (md5s match the report pins) and preserved its own copies
+(gitignored) as `lab/tmp/witness-w20-{asan,plain,naive}*` with md5s on
+its wall. Source cites re-verified in the witness's own tree
+(`ngx_event_openssl.c:3150`, `filter:1274`, `v2.c:544`, the
+`v2.c:432` flood guard) — all exact. Ladder: rung 3 wire-pure is
+ESTABLISHED under independent hands; rung 4 stays NO.
 
 **Control (1.31.9, identical probe):** the very first cycle WU is refused —
 "client violated connection flow control: received WINDOW_UPDATE frame
@@ -1120,7 +1162,10 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
    `… 50000000 0 1000000 600 0` reproduces the naive flood-guard wall
    (abort at ~37.7M WUs, "http2 flood detected"), and
    `… 4294967300 1 268435456 21600 1` reproduces the boundary negative
-   (full pump, no crash: ledger ≈ 2^63 − 1.2e9 at the trigger).
+   (full pump, no crash: ledger ≈ 2^63 − 1.2e9 at the trigger). All
+   three commands reproduced independently by the witness — 3/3 from
+   a clean checkout at commit `5f37a53` (DM #66); rung 3 wire-pure is
+   established under independent hands.
 
 ## Evidence ledger
 
@@ -1130,9 +1175,9 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
 | Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
 | Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 = 4658x MAX + 98,304, all 4693 credits accepted, author 1/1 + witness 1/1 (the earlier "2/2" was one run under two byte-identical log files, same worker PID 566660; witness run PID 624758), worker clean under ASan (`gdb-wu-1.31.8-1e13.log`, witness log `gdb-wu-1.31.8-4656-witness.log`) |
-| Reproducible crash (ledger debugger-forced in wake 7; wire-pumped since wake 20) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`). Wake 20: the same crash reached WIRE-PURE — run 2 of "Stage B" (N = 2^32+1024, no debugger anywhere in the loop) pumps the ledger over the full ~2^32-WU stretch and the trigger GET aborts the worker (exit 1, ASan memcpy ranges `0x800001fdbc22fbfe`); on the plain build the consumer fires wire-pure mid-pump, no trigger GET needed (`worker exited on signal 11` once the ledger crosses 2^63 with a live response stream — run 3, "Stage B") |
-| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer. Wake 20: confirmed WIRE-PURE — ledger wire-pumped to `2^63 + 2,189,294,763,006` (crash-observed wrapped length, agreeing with the pump arithmetic to the identified 2,195,456-byte double-counted burst charge), ASan memcpy-param-overlap with both ranges `0x800001fdbc22fbfe` into the 16 KiB SSL buffer — see "Stage B" |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger is now WIRE-PUMPED (wake 20, "Stage B") — rung 4 stays NO for content/placement reasons: Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level; route records witness-CONFIRMED under their own fetches, DM #58): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump) RUN (owner DM #59, wake 20):** the ledger is wire-pumped to `2^63 + 2.19e12` and the rung-3 trigger fires wire-pure (see "Stage B"); rung 4 stays NO — Stage C's consumer has no write to hijack on any build this lab can execute (the zero-store wall above), so a wire-pure ledger does not by itself move rung 4 |
+| Reproducible crash (ledger debugger-forced in wake 7; wire-pumped since wake 20) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`). Wake 20: the same crash reached WIRE-PURE — run 2 of "Stage B" (N = 2^32+1024, no debugger anywhere in the loop) pumps the ledger over the full ~2^32-WU stretch and the trigger GET aborts the worker (exit 1, ASan memcpy ranges `0x800001fdbc22fbfe`); on the plain build the consumer fires wire-pure mid-pump, no trigger GET needed (`worker exited on signal 11` once the ledger crosses 2^63 with a live response stream — run 3, "Stage B"); the full Stage B sequence witness-reproduced 3/3 from a clean checkout (DM #66) |
+| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer. Wake 20: confirmed WIRE-PURE — ledger wire-pumped to `2^63 + 2,189,294,763,006` (crash-observed wrapped length, agreeing with the pump arithmetic to the identified 2,195,456-byte double-counted burst charge), ASan memcpy-param-overlap with both ranges `0x800001fdbc22fbfe` into the 16 KiB SSL buffer — see "Stage B"; wire-pure rung 3 witness-CONFIRMED 3/3, both ASan range lengths machine-checked independently (DM #66) |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger is now WIRE-PUMPED (wake 20, "Stage B") — rung 4 stays NO for content/placement reasons: Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level; route records witness-CONFIRMED under their own fetches, DM #58): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump) RUN (owner DM #59, wake 20):** the ledger is wire-pumped to `2^63 + 2.19e12` and the rung-3 trigger fires wire-pure (see "Stage B"); rung 4 stays NO — Stage C's consumer has no write to hijack on any build this lab can execute (the zero-store wall above), so a wire-pure ledger does not by itself move rung 4; the witness Stage B re-run found no counterexample (DM #66) |
 | Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half, witness-confirmed (DM #51) | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary — see "Stage-A-mechanics" |
 | Stage-A-mechanics grooming slice (SYNTHETIC, owner #47 + standing approval item 1; NOT a rung-4 claim) | mechanics POSITIVE, grooming half, witness-confirmed | wake 16, witness 2/2 (DM #53; amendment verified DM #55): `/canary`-sprayed victims occupy 87% of the victims window at computable, run-stable offsets (byte-exact per-chunk maps `canary_off = win_off + K`, identical across 3 author runs + 2 witness runs); the store-first copy replaces them with byte-exact chosen blob bytes below its 118,784-byte stored extent, zero canary magic surviving inside it, and content-valid sprayed victims survive past the extent; run-varying bytes confined to a ~16 KiB nginx-interleaved buffer between the sprayed spans — see "Stage-A-mechanics grooming slice" |
 
