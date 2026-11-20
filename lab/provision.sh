@@ -34,4 +34,25 @@ while [ $# -gt 0 ]; do
   echo "extracted nginx-src/nginx-$ver"
 done
 
+# --- gitignored lab corpus + TLS cert (idempotent; see report repro plan) ---
+mkdir -p corpus ssl
+if [ ! -f ssl/cert.pem ] || [ ! -f ssl/key.pem ]; then
+  echo "generating ssl/cert.pem + ssl/key.pem (throwaway lab cert)" >&2
+  openssl req -x509 -newkey rsa:2048 -keyout ssl/key.pem -out ssl/cert.pem \
+    -days 3650 -nodes -subj "/CN=localhost" >/dev/null 2>&1
+fi
+if [ ! -f corpus/blob ]; then
+  echo "generating corpus/blob (64 MiB urandom)" >&2
+  dd if=/dev/urandom of=corpus/blob bs=1M count=64 status=none
+fi
+# Canary corpus for the Stage-A-mechanics grooming slice: 16 MiB of
+# 32-byte records, magic(8) + reserved(4) + LE record-index(8) + pad(12),
+# so any surviving or partial record in a dumped window resolves to its
+# exact file offset. Regenerate deterministically (committed generator:
+# lab/harness/xgroom-verify.py --make-canary).
+if [ ! -f corpus/canary ]; then
+  echo "generating corpus/canary (16 MiB records)" >&2
+  python3 harness/xgroom-verify.py --make-canary corpus/canary
+fi
+echo "corpus: $(ls corpus)"
 echo "provisioned: $(ls nginx-src)"

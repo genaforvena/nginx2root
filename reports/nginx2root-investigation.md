@@ -775,6 +775,69 @@ object to a chosen offset in that window) — the next mechanics slice if
 directed; and any stock-build claim remains walled as above. Ladder
 unchanged: rung 4 NO.
 
+## Stage-A-mechanics grooming slice: sprayed victims at computable offsets (wake 16, 2026-11-20 — SYNTHETIC, mechanics-only, owner directive #47 + standing approval item 1)
+
+The half of Stage-A mechanics wake 15 left open — whether nginx-side
+heap grooming can place a victim object in the overwrite window — is
+now exercised and answers POSITIVE under the same label discipline:
+LD_PRELOAD store-first memcpy, stock-glibc wall unwalled, no rung-4
+claim on any stock build.
+
+Method: a canary corpus — 16 MiB of 32-byte records (magic, reserved,
+LE record index, 0xA5 pad; generator `lab/harness/xgroom-verify.py
+--make-canary`, provisioned idempotently by `lab/provision.sh`, served
+from a new `location = /canary`) — is sprayed by the probe
+`lab/harness/xgroom.py`, which is `xprobe.py` with every VICTIM-side
+stream (1, 3, pump 5..69) GETing `/canary`; the phase-X stream 71 stays
+on `/blob`, so the wrapped copy's SOURCE is still chosen blob bytes.
+The flow-control ledger is byte-count driven and unaffected: the gdb
+PINGMARK/XFORCE/CHARGE/MECHCALL lines are byte-identical to the
+all-`/blob` mechanics run, and the call geometry is unchanged
+(`dst=0x555555779b4a`, `src=0x555555a25630`, `n=2^63+2^32`).
+Runner: `lab/harness/run-x-groom.sh 1.31.8-plain` (dumps the victims
+window `dst+0x4000..dst+0x22000` pre/post-copy plus the stored span);
+offline verdict `xgroom-verify.py`. 3 runs, identical verdicts and
+identical spray geometry.
+
+Observed (`lab/tmp/gdb-x-groom-1.31.8-plain.log`, dumps
+`lab/tmp/x-groom-*.bin`):
+
+1. **The spray lands at computable, run-stable offsets.** The pre-copy
+   victims window is 87% content-valid canary in two spans:
+   `win[0x6..0x6ce6]` = `canary[0x209320:0x210000]` with the linear map
+   `canary_off = win_off + 0x209300` exact (871/871 records) — that is
+   stream 1's sequential read chunks packed immediately past the 16 KiB
+   SSL buffer — and `win[0xad76..0x1dff6]` = pump-stream chunks
+   (2451/2451 records content-valid, per-chunk K). One intermediate
+   run with only stream 1 sprayed had the window tail occupied by pump
+   blob chunks, so the pump streams were switched to `/canary` to carry
+   the spray past the copy's reach.
+2. **Chosen bytes replace sprayed victims.** The stored span
+   `dst..dst+0x8000` is byte-exact `blob[0:0x8000]`, and below the
+   stored extent (`0x1d000` = 118,784 bytes) ZERO canary magic survives
+   post-copy.
+3. **The spray outruns the copy.** A pump-stream canary chunk survives
+   past the extent at `win[0x199e6..0x1dff6]` =
+   `canary[0x6c60:0xb260]` (K = 0x6260 exact, 560/560 records
+   content-valid): the overwrite boundary is directly readable in the
+   victim layout.
+4. **What varies between runs** (honest determinism bound): every
+   canary byte, both K maps, the blob span and the surviving span are
+   byte-identical across runs; the varying bytes are a ~16 KiB
+   nginx-interleaved allocation sitting BETWEEN the sprayed spans
+   (16,294 of its bytes differ run-to-run) and a 16-byte heap value that
+   the copy drags in as noise at `dst+0x1003a`. Sprayed-victim geometry
+   is deterministic; nginx's own interleaved buffer content is not.
+
+Mechanics conclusion: nginx-side grooming DOES place chosen victim
+content at computable, run-stable offsets across the whole overwrite
+window (stream-1 chunks immediately past the SSL buffer, pump chunks
+beyond the copy's reach), and the synthetic store-first copy replaces
+the sprayed victims with chosen bytes below its stored extent. For a
+stock-build claim the wake-15 wall stands unchanged: no store-first
+consumer exists on any executable profile this lab can run (2.39
+executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
+
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
@@ -821,6 +884,14 @@ unchanged: rung 4 NO.
    reproduces the store-first copy: chosen blob bytes at deterministic
    offsets past the SSL buffer, read-side SEGV_MAPERR stop, offline
    verification against `lab/corpus/blob`.
+8. **Stage-A-mechanics grooming slice (SYNTHETIC, owner directive #47 +
+   standing approval item 1) — DONE as a mechanics POSITIVE: see
+   "Stage-A-mechanics grooming slice".** `lab/provision.sh` (now also
+   provisions the canary corpus), then `lab/harness/run-x-groom.sh
+   1.31.8-plain` sprays identifiable victims via `/canary`, triggers the
+   same forced-ledger wrapped copy, and the built-in
+   `xgroom-verify.py` check grades the spray geometry, the chosen-byte
+   replacement and the surviving victims past the stored extent.
 
 ## Evidence ledger
 
@@ -833,7 +904,8 @@ unchanged: rung 4 NO.
 | Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
 | Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
-| Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary; grooming of a victim to a chosen offset NOT yet exercised — see "Stage-A-mechanics" |
+| Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary — see "Stage-A-mechanics" |
+| Stage-A-mechanics grooming slice (SYNTHETIC, owner #47 + standing approval item 1; NOT a rung-4 claim) | mechanics POSITIVE, grooming half | wake 16: `/canary`-sprayed victims occupy 87% of the victims window at computable, run-stable offsets (per-span K maps byte-identical across 3 runs); the store-first copy replaces them with byte-exact chosen blob bytes below its 118,784-byte stored extent, zero canary magic surviving inside it, and content-valid sprayed victims survive past the extent; run-varying bytes confined to a ~16 KiB nginx-interleaved buffer between the sprayed spans — see "Stage-A-mechanics grooming slice" |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
