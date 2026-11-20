@@ -738,6 +738,19 @@ by the remote attacker — so the rung-4 NO stands; these routes are
 recorded as the honest boundary of the template disposition, not an
 upgrade.
 
+Witness verdict (DM #58, 2026-11-20): the wake-18 route records above
+are CONFIRMED under the witness's own fetches — all four pinned
+sha256s matched byte-for-byte, and every line cite above was
+re-verified in their own copies (erms 44-61 with the dst<src branch
+going straight to the forward `rep`; ifunc 56-58 and 60-71;
+cpu-tunables 192-194 as the only Prefer_* writer besides their
+tree-wide grep; and the 420-line no-vzeroupper file: no entry
+validation, the shared-cache-half `jae` at 165 guarding
+`L(preloop_large)` at 338, head loads at 341-342, four canonical
+loads plus four progressive `vmovntdq` stores per 256 bytes at
+361-368). Nothing further is pending in either direction on this
+slice.
+
 Fetched-file sha256 (2026-11-20 evidence pin; copies under
 `lab/tmp/glibc-src/`, gitignored): 2.41 template
 `47926a9056c1805d9cd8109ef80e0c7f3a52f950e6ddec6a03dc10b6260848c1`,
@@ -967,7 +980,10 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
    offline with the `curl` command quoted in the survey section (fetch
    both tags, `diff -u`: only the copyright line differs) —
    witness-CONFIRMED (DM #51), whose counterexample hunt also produced
-   the two non-default store-first routes now recorded there.
+   the two non-default store-first routes now recorded there — those
+   route records themselves witness-CONFIRMED (DM #58) under the
+   witness's own fetches (all four pinned sha256s matched, every line
+   cite re-verified in their own copies).
 7. **Stage-A-mechanics (SYNTHETIC, owner directive #47) — DONE as a
    mechanics POSITIVE for the chosen-byte half: see "Stage-A-mechanics".**
    `lab/harness/run-x-mechanics.sh 1.31.8-plain` (builds the shim itself)
@@ -993,7 +1009,7 @@ executed wall, 2.41 static wall). Ladder unchanged: rung 4 NO.
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 = 4658x MAX + 98,304, all 4693 credits accepted, author 1/1 + witness 1/1 (the earlier "2/2" was one run under two byte-identical log files, same worker PID 566660; witness run PID 624758), worker clean under ASan (`gdb-wu-1.31.8-1e13.log`, witness log `gdb-wu-1.31.8-4656-witness.log`) |
 | Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). Wake 18 (witness #51, reproduced at source level; route records witness-CONFIRMED under their own fetches, DM #58): two NON-default stock-2.41 routes to store-first files exist — admin hwcaps tunables (Prefer_FSRM/Prefer_ERMS → bare-rep-movsb `__memmove_erms`) and AVX512F-without-AVX512VL (KNL-class, or tunable `-AVX512VL` → hand-written `__memmove_avx512_no_vzeroupper`, store-first `L(preloop_large)`) — client-unreachable on a default deployment; recorded as the template disposition's boundary, see "Stage-A survey". **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
 | Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half, witness-confirmed (DM #51) | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary — see "Stage-A-mechanics" |
 | Stage-A-mechanics grooming slice (SYNTHETIC, owner #47 + standing approval item 1; NOT a rung-4 claim) | mechanics POSITIVE, grooming half, witness-confirmed | wake 16, witness 2/2 (DM #53; amendment verified DM #55): `/canary`-sprayed victims occupy 87% of the victims window at computable, run-stable offsets (byte-exact per-chunk maps `canary_off = win_off + K`, identical across 3 author runs + 2 witness runs); the store-first copy replaces them with byte-exact chosen blob bytes below its 118,784-byte stored extent, zero canary magic surviving inside it, and content-valid sprayed victims survive past the extent; run-varying bytes confined to a ~16 KiB nginx-interleaved buffer between the sprayed spans — see "Stage-A-mechanics grooming slice" |
 
