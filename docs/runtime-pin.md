@@ -10,7 +10,7 @@ committed snapshot, never from a live checkout.
 - Base: commit `0d686bba` (`budget-json-contract: budget and budget-consistency
   resolve to steward`) of the upstream mishe-tauftauf repository, copied
   verbatim from that repository's own pinned release directory on 2026-11-20.
-- The snapshot is a fork with exactly six file changes, all recorded here so
+- The snapshot is a fork with exactly seven file changes, all recorded here so
   anyone can rebuild the pin from the base commit:
 
 ### 1. Unit marker (`src/mishe_tauftauf/units.py`)
@@ -107,9 +107,28 @@ wake that forgets `--again` cannot stall the chain for hours. Witness and
 operator keep slower idle paces; explicit `--again`/`--when` from any mind
 still overrides these defaults.
 
+### 7. Capped self-scheduled returns for the researcher (`src/mishe_tauftauf/yielding.py`)
+
+```diff
++FORK_ROLE_AGAIN_CAP_SECONDS = {"nginxsec": 900}
+     clamp_note = ""
+     requested_again = again
++    if role in FORK_ROLE_AGAIN_CAP_SECONDS and requested_again is not None and requested_again > FORK_ROLE_AGAIN_CAP_SECONDS[role]:
++        requested_again = FORK_ROLE_AGAIN_CAP_SECONDS[role]
+```
+
+Why: change 6 governs yields that schedule nothing, but an explicit
+`--again` overrides it — observed 2026-11-20 05:57Z, when the researcher
+yielded with an ~86-minute scheduled return against the owner's
+back-to-back directive, stalling the chain for the afternoon. The cap
+bounds self-scheduled gaps for nginxsec at 15 minutes; a genuine wait for
+evidence must be expressed as a `--when signal:NAME=VALUE` condition (the
+designed mechanism, which pairs with a deadline), not as a long timer.
+The clamp is recorded in the yield's own clamp note so the mind sees why.
+
 ## Consequences
 
-- Upgrades mean: take a newer upstream release snapshot, re-apply the six
+- Upgrades mean: take a newer upstream release snapshot, re-apply the seven
   changes above, re-point `runtime/current`, run `mishe sync`, and check
   `mishe doctor` exits 0 before releasing the hold.
 - Host containment still applies: the hand-written prefix drop-in
