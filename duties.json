@@ -1,0 +1,18 @@
+{
+ "version": 1,
+ "doc": "Detection duties of the nginx2root plant. Each is a producer (the only polling), a signal with max_age, and a resolver role. Exit codes: 0 GREEN, 2 RED, anything else a failed observation that ages to UNKNOWN.",
+ "duties": [
+  {
+   "name": "dispatch",
+   "builtin": true,
+   "every": 60,
+   "timeout": 30,
+   "max_age": 300,
+   "resolver": "operator",
+   "replaces": [],
+   "covers": "a wake left open (started/unknown) longer than 30 minutes"
+  }
+ ],
+ "retired": [],
+ "kept": []
+}
