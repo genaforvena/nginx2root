@@ -5,8 +5,10 @@ window becomes a confirmed heap buffer overflow.** At
 `h2c->send_window >= 2^63` the queue-time limit cast in
 `ngx_http_v2_send_chain` goes negative, a DATA frame body is built from a
 wrapped ~2^63-byte length, and the SSL send chain `memcpy`s `2^63 + 2^32`
-bytes into a 16 KiB heap buffer — ASan report, worker abort, 2
-byte-identical runs (rung 3 below). The ledger state feeding it is
+bytes into a 16 KiB heap buffer — ASan report, worker abort (rung 3
+below; independently reproduced by the witness from a clean checkout,
+and on an unsanitized build the same probe makes the raw glibc memcpy
+execute and SIGSEGV the worker). The ledger state feeding it is
 wire-proven unbounded past MAX (rung 2.75: interleave double-credit, guard
 underflow, patched build refuses the same sequence); the jump from there
 to 2^63 was forced in gdb, not wire-pumped (~56 GB of client traffic,
@@ -38,7 +40,11 @@ cd lab/nginx-src/nginx-1.31.8 && ./configure \
 
 - `lab/build/1.31.8/` — affected. `sbin/nginx -V`: nginx/1.31.8, gcc 13.3.0,
   OpenSSL 3.0.13, ASan+UBSan, `--with-debug`.
-- `lab/build/1.31.9/` — patched control, same flags.
+- `lab/build/1.31.8-plain/` — affected, UNSANITIZED control for rung 3:
+  same configure line minus the `-fsanitize` options (`-g -O1
+  -fno-omit-frame-pointer`, `--with-debug`), built by the witness
+  2026-11-20 from the same pinned tree; used by
+  `lab/harness/run-x-plain.sh`.
 
 ## The patch (1.31.8 → 1.31.9), complete hunk inventory
 
@@ -72,9 +78,17 @@ changes:
      `h2c->send_queued -= window`.
 
 Cross-check against upstream nginx commit
-`b89c4100bf6762a45e4a6463eaf4b70368277c94`: NOT DONE (commit not at a ref
-tip on the GitHub mirror; the tag diff above is the working evidence).
-UNKNOWN whether the tag diff is byte-identical to that commit.
+`b89c4100bf6762a45e4a6463eaf4b70368277c94` (witness, 2026-11-20): the
+commit IS reachable on github.com/nginx/nginx. All six of its added lines
+match the 1.31.9 tag diff exactly, but the tag diff is a SUPERSET — it
+also bundles the `ngx_http_v2_data_frame_handler` refund filter, the
+SETTINGS ACK `&` check, `ngx_reusable_connection`, and the
+`queue_position`/trailers refactor — so the tag diff is NOT
+byte-identical to that commit. Upstream's commit message corroborates the
+exact mechanism and consumer found here: a WINDOW_UPDATE arriving between
+queue and terminate drives `send_window` past `MAX_WINDOW`, causing
+"broken buffer size control in `ngx_http_v2_send_chain()` followed by
+memory corruption and a possible segmentation fault".
 
 ## Fault sites in 1.31.8 (the affected tree), with evidence
 
@@ -428,8 +442,9 @@ DATA-frame body with `last = pos + (2^63 + 2^32)` (mod 2^64), i.e.
 header length is the low 24 bits (`0x000000`, a zero-length DATA frame) —
 the corruption is entirely in the heap bookkeeping, not the wire bytes.
 
-**Observed chain (2 runs, byte-identical; `lab/tmp/gdb-x-1.31.8.log`,
-ASan report `lab/tmp/x-1.31.8.log`):**
+**Observed chain (2 runs byte-identical, plus an independent witness
+re-run from a clean checkout: 3/3; `lab/tmp/gdb-x-1.31.8.log`, ASan
+report `lab/tmp/x-1.31.8.log`):**
 
 ```
 XFORCE     send_window=9223372041149743104              <- forced at mkX0ping
@@ -465,17 +480,23 @@ ERROR: AddressSanitizer: memcpy-param-overlap: memory ranges
 ```
 
 Both ranges are exactly `2^63 + 2^32` bytes. The destination is a 16 KiB
-heap allocation and the source a 32 KiB one: without ASan this is an
-out-of-bounds heap write (and read) of astronomic length that faults the
-worker within kilobytes — a heap buffer overflow followed by worker death,
-the CVE's own wording, reproduced in class and mechanism. ASan labels it
+heap allocation and the source a 32 KiB one. **No-ASan control (witness +
+author re-run):** on an unsanitized 1.31.8 build
+(`lab/build/1.31.8-plain`, `-g -O1 -fno-omit-frame-pointer`) the same
+probe and the same gdb force make the real glibc memcpy execute —
+`__memcpy_avx_unaligned_erms` with `__len = 9223372041149743104` from
+`ngx_ssl_send_chain:3150` via `v2.c:544/489` — and the worker SIGSEGVs,
+3/3 runs, no sanitizer involved (`lab/tmp/gdb-x-1.31.8-plain-bt.log` has
+the full backtrace; harness `lab/harness/run-x-plain.sh`). A heap buffer
+overflow followed by worker death — the CVE's own wording — is therefore
+observed both sanitizer-labeled and raw, not inferred. ASan labels it
 `memcpy-param-overlap` because the two enormous ranges nominally
 intersect; the substantive violations are the `2^63 + 2^32`-byte copy into
 a 16 KiB buffer (OOB write) and out of a 32 KiB buffer (OOB read).
 
 **Ladder: rung 3 — confirmed memory corruption** (ASan-observed,
-deterministic client input + one debugger-forced ledger jump, 2 runs
-byte-identical). NOT rung 4: no control exercised over the overflow's
+deterministic client input + one debugger-forced ledger jump; 2 runs
+byte-identical + witness 3/3 + plain-build SIGSEGV 3/3). NOT rung 4: no
 contents or placement beyond its length, and the 2^63 ledger was not
 wire-pumped. The consumer code (`send_chain` limit cast, `get_shadow`,
 `ngx_ssl_send_chain`) is IDENTICAL in 1.31.9 — the patch fixes the guard
@@ -517,9 +538,12 @@ the .9 differential is rung 2.75's.
 4. **Corruption attempt (rung 3) — DONE as a POSITIVE, debugger-assisted:
    see "Extreme-window consumer".** `lab/harness/run-x.sh 1.31.8`
    reproduces the confirmed heap buffer overflow (ASan report + worker
-   abort, byte-identical 2 runs): ledger forced to `2^63 + 2^32` after the
-   wire-proven pump. The wake-6 negative below 2^63 stands; no consumer
-   exists between `6x MAX` and `2^63 - 1`.
+   abort, byte-identical 2 runs + witness 3/3): ledger forced to
+   `2^63 + 2^32` after the wire-proven pump. `lab/harness/run-x-plain.sh`
+   does the same against the unsanitized `1.31.8-plain` build: raw glibc
+   memcpy executes with `__len = 2^63 + 2^32` and the worker SIGSEGVs
+   (witness 2/2 + author re-run 1/1). The wake-6 negative below 2^63
+   stands; no consumer exists between `6x MAX` and `2^63 - 1`.
 5. **Control:** DONE — 1.31.9 rejects the over-credit probe (wake 4) and
    the interleave probe (wake 6) at the guard (`v2.c:2564/2565`, with
    `- h2c->send_queued` in the .9 guard).
@@ -532,8 +556,8 @@ the .9 differential is rung 2.75's.
 | Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
 | Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0 |
-| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2, given the forced `2^63 + 2^32` ledger; the wire path to that ledger is proven to exist but was not pumped (~2^32 max-WUs) |
-| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
+| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 2/2 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is proven to exist but was not pumped (~2^32 max-WUs) |
+| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 3/3. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
 | Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
@@ -541,4 +565,5 @@ the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
 interleave finding of wake 6), the three falsified queueing models in
 "Falsified models", the wake-6 falsified models in the rung-2.75 section, the
 wake-6 "no threshold on paper" model killed at 2^63 (rung-3 section), and
-the un-verified upstream-commit cross-check.
+the upstream-commit cross-check (witness-verified: six-line match, tag diff
+a superset — see "The patch").
