@@ -10,7 +10,7 @@ committed snapshot, never from a live checkout.
 - Base: commit `0d686bba` (`budget-json-contract: budget and budget-consistency
   resolve to steward`) of the upstream mishe-tauftauf repository, copied
   verbatim from that repository's own pinned release directory on 2026-11-20.
-- The snapshot is a fork with exactly four file changes, all recorded here so
+- The snapshot is a fork with exactly six file changes, all recorded here so
   anyone can rebuild the pin from the base commit:
 
 ### 1. Unit marker (`src/mishe_tauftauf/units.py`)
@@ -75,10 +75,41 @@ The main plant's own sync now refuses foreign-marked paths (upstream commit
 fork change. Keep the `nginx2root-plants.slice` drop-ins; undo is the one-line
 revert above plus a `daemon-reload`.
 
+### 5. Operator view dialogue block (`src/mishe_tauftauf/plant_view.py`)
+
+```diff
+     if role == 'operator':
+-        out += _dialogue_block(home)
++        pass  # fork change 5: no household dialogue in this plant
+```
+
+Why: `_dialogue_block` renders the host-level household conversation tails
+from `~/.mesh/` (Ilya/Rozalia) on every plant's operator pane. On this host
+that content belongs to the main plant; this plant's operator is a delegate
+mind with no household channel, and the foreign, never-updating text made
+the operator window read as hung. This plant's operator view is its wall,
+signals, dispatch and mail, nothing else.
+
+### 6. Per-role idle pace (`src/mishe_tauftauf/yielding.py`)
+
+```diff
++FORK_ROLE_IDLE_SECONDS = {"nginxsec": 300, "witness": 1800, "operator": 1800}
+ def idle_delay(home, role, now, idle_seconds) -> float:
++    if idle_seconds == DEFAULT_IDLE_SECONDS and role in FORK_ROLE_IDLE_SECONDS:
++        return FORK_ROLE_IDLE_SECONDS[role]
+```
+
+Why: the upstream default for a yield that schedules nothing is a 2-hour
+idle initiative, and the 30-minute open-lane acceleration needs budget
+evidence this plant deliberately does not run. The owner wants the research
+back-to-back: an unscheduled nginxsec yield now returns in 5 minutes, so a
+wake that forgets `--again` cannot stall the chain for hours. Witness and
+operator keep slower idle paces; explicit `--again`/`--when` from any mind
+still overrides these defaults.
 
 ## Consequences
 
-- Upgrades mean: take a newer upstream release snapshot, re-apply the four
+- Upgrades mean: take a newer upstream release snapshot, re-apply the six
   changes above, re-point `runtime/current`, run `mishe sync`, and check
   `mishe doctor` exits 0 before releasing the hold.
 - Host containment still applies: the hand-written prefix drop-in
