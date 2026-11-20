@@ -1,13 +1,19 @@
 # NGINX2Root / CVE-2026-123007 — nginx HTTP/2 flow-control investigation
 
-Status: **demonstrated unbounded connection-window over-credit (the exact
-ledger state NGINX2Root claims) on the affected build, with the patched build
-refusing it — but no memory corruption**: `h2c->send_window` was driven past
-`NGX_HTTP_V2_MAX_WINDOW` to ~12.9 billion (6x the RFC ceiling) and the guard
-underflowed exactly as claimed, with zero ASan/UBSan findings (rung 2.75
-below). Every claim is either cited to `file:line` in the extracted 1.31.8
-tree, backed by observed worker bytes (log lines / gdb memory reads), or
-marked UNKNOWN.
+Status: **rung 3 reached (debugger-assisted): the over-credited connection
+window becomes a confirmed heap buffer overflow.** At
+`h2c->send_window >= 2^63` the queue-time limit cast in
+`ngx_http_v2_send_chain` goes negative, a DATA frame body is built from a
+wrapped ~2^63-byte length, and the SSL send chain `memcpy`s `2^63 + 2^32`
+bytes into a 16 KiB heap buffer — ASan report, worker abort, 2
+byte-identical runs (rung 3 below). The ledger state feeding it is
+wire-proven unbounded past MAX (rung 2.75: interleave double-credit, guard
+underflow, patched build refuses the same sequence); the jump from there
+to 2^63 was forced in gdb, not wire-pumped (~56 GB of client traffic,
+the order of magnitude NGINX2Root claims for its full `--exploit`). Every
+claim is either cited to `file:line` in the extracted 1.31.8 tree, backed
+by observed worker bytes (log lines / gdb memory reads), or marked
+UNKNOWN.
 
 ## Scope and method
 
@@ -156,15 +162,16 @@ the route:
    line) before trusting my reading of it either way.
 4. Where, if anywhere, does an over-credited window become a memory-safety
    fault (allocation sized by a window, or a size_t wrap consumed by a
-   length)? **NEGATIVE on this build so far (wake 6):** the static consumer
-   sweep found no window-derived allocation, length or index anywhere the
-   over-credit reaches, and the ASan soak over `send_window ≈ 6x MAX`
-   with 36.7 MB streamed produced zero reports. Untried avenues: extreme
-   window values beyond 6x MAX (no code path scales with the value —
-   nothing on paper suggests a threshold), a 32-bit build (where
-   `MAX_WINDOW - send_window` truncates differently), or consumers in
-   third-party/vendored filter modules. Do not upgrade the ladder without
-   ASan bytes.
+   length)? **ANSWERED (wake 7): at `h2c->send_window >= 2^63` exactly** —
+   not an allocation and not a scaling effect, but a **cast boundary**: the
+   `(off_t)` cast in the queue-time limit (`filter:1144`) goes negative,
+   `frame_size = (size_t) limit` wraps (`filter:1165`), the DATA-frame
+   body buf gets `last = pos + 2^63 + 2^32` (`get_shadow`, `filter:1308`),
+   and the SSL send chain memcpy's the wrapped length into its 16 KiB
+   buffer (`ngx_event_openssl.c:3137/3150`) — ASan-observed heap buffer
+   overflow, worker abort. Below 2^63 the wake-6 negative holds unchanged:
+   no allocation, length or index scales with the window value. See
+   "Extreme-window consumer" (rung 3).
 
 ## Observed over-credit (wake 4, 2026-11-20 — rung-2 evidence)
 
@@ -389,6 +396,109 @@ memory corruption.
    (`filter:864`), so only DATA frames are ever refunded in 1.31.8 — the
    double-credit needs the interleave, not a phantom uncharged frame.
 
+
+## Extreme-window consumer: confirmed heap buffer overflow (wake 7, 2026-11-20 — rung 3, debugger-assisted)
+
+Harness: `lab/harness/xprobe.py` (client), `lab/harness/run-x.sh 1.31.8`
+(runner), `lab/harness/gdb-x.cmd` (breakpoints + the forced value).
+Phases A-C are the wake-6 wuprobe sequence verbatim (pump to the wrapped
+guard, `mkC2 = 4,295,065,598 ≈ 2x MAX`). Phase X: at the `mkX0ping` PING
+marker, gdb FORCES `h2c->send_window = 2^63 + 2^32` =
+9,223,372,041,149,743,104 — the ledger the wire path would reach after
+~2^32 further standalone max-size WUs (13 bytes each, ≈ 56 GB of client
+traffic; NGINX2Root claims ~119 GiB for its full `--exploit`, the same
+order of magnitude — consistency, not proof). A fresh GET on stream 71
+then runs `ngx_http_v2_send_chain` with that ledger. Debugger-assisted by
+design and labeled so: the pump below MAX and the guard underflow are
+wire-proven (rung 2.75); only the 2^32-fold repetition of an already
+observed accepted-WU step was compressed into one gdb assignment.
+
+**Why 2^63 is the exact threshold (static).** `filter:1144` computes the
+queue-time limit as `limit = h2c->send_window` behind the test
+`limit > (off_t) h2c->send_window`. At or above 2^63 the cast is negative,
+so any caller limit takes the branch and `limit` becomes negative; below
+2^63 the cast is positive and nothing scales with the window (wake-6
+negative). With `limit` negative: `frame_size = (size_t) limit`
+(`filter:1165`) wraps to `2^63 + 2^32`; `get_shadow` (`filter:1308` — the
+in-memory branch: over TLS the copy filter turns static-file bufs into
+memory bufs via `ngx_http_copy_filter`/`ngx_output_chain`, so the
+`in_file` branch at 1311-1313 is dead in this lab shape) builds the
+DATA-frame body with `last = pos + (2^63 + 2^32)` (mod 2^64), i.e.
+`last - pos` = `-2^63 + 2^32` as a signed value. The frame's on-wire
+header length is the low 24 bits (`0x000000`, a zero-length DATA frame) —
+the corruption is entirely in the heap bookkeeping, not the wire bytes.
+
+**Observed chain (2 runs, byte-identical; `lab/tmp/gdb-x-1.31.8.log`,
+ASan report `lab/tmp/x-1.31.8.log`):**
+
+```
+XFORCE     send_window=9223372041149743104              <- forced at mkX0ping
+LIMITWRAP  limit=-9223372032559808512 frame_size=9223372041149743104
+SHADOW     size=-9223372032559808512 pos=0x52d0002bc400
+CHARGE     sid=71 frame_size=9223372041149743104        <- send_window -> 0
+SSLMEMCPY  size=-9223372032559808512 dst=0x52900006a52a src=0x52d0002bc400
+```
+
+Every wrapped constant is the same number: `2^63 + 2^32` unsigned =
+`-9223372032559808512` signed. (gdb -O1 note: the breakpoint at
+`filter:1165` stops on the hoisted store; the printed `frame_size` is
+already the wrapped value, cross-checked by the CHARGE line.)
+
+**The consuming fault.** `ngx_http_v2_send_output_queue` hands the frame
+chain to the TLS send chain (`v2.c:544`). `ngx_ssl_send_chain` coalesces
+frame bufs into its 16 KiB buffer: `size = in->buf->last - in->buf->pos`
+(`ngx_event_openssl.c:3137`) evaluates to `-2^63 + 2^32` as `ssize_t`;
+both guards — `size > buf->end - buf->last` (`:3139`) and
+`send + size > limit` (`:3143`) — are signed compares and **skip** a
+negative size; `ngx_memcpy(buf->last, in->buf->pos, size)` (`:3150`)
+converts it back to `size_t`:
+
+```
+ERROR: AddressSanitizer: memcpy-param-overlap: memory ranges
+  [0x52900006a52a, 0x800052910006a52a) and [0x52d0002bc400, 0x800052d1002bc400) overlap
+    #2 ngx_ssl_send_chain src/event/ngx_event_openssl.c:3150
+    #3 ngx_http_v2_send_output_queue src/http/v2/ngx_http_v2.c:544
+    #4 ngx_http_v2_write_handler src/http/v2/ngx_http_v2.c:489
+  dst = 16 KiB c->ssl->buf (ngx_event_openssl.c:3098) + 4906 bytes in
+  src = 32 KiB copy-filter buf (ngx_http_copy_filter -> ngx_output_chain_get_buf)
+==...==ABORTING   worker exits 1; master respawns a fresh worker
+```
+
+Both ranges are exactly `2^63 + 2^32` bytes. The destination is a 16 KiB
+heap allocation and the source a 32 KiB one: without ASan this is an
+out-of-bounds heap write (and read) of astronomic length that faults the
+worker within kilobytes — a heap buffer overflow followed by worker death,
+the CVE's own wording, reproduced in class and mechanism. ASan labels it
+`memcpy-param-overlap` because the two enormous ranges nominally
+intersect; the substantive violations are the `2^63 + 2^32`-byte copy into
+a 16 KiB buffer (OOB write) and out of a 32 KiB buffer (OOB read).
+
+**Ladder: rung 3 — confirmed memory corruption** (ASan-observed,
+deterministic client input + one debugger-forced ledger jump, 2 runs
+byte-identical). NOT rung 4: no control exercised over the overflow's
+contents or placement beyond its length, and the 2^63 ledger was not
+wire-pumped. The consumer code (`send_chain` limit cast, `get_shadow`,
+`ngx_ssl_send_chain`) is IDENTICAL in 1.31.9 — the patch fixes the guard
+and the ledger, not the consumer — so a .9 control run of this experiment
+would be meaningless (forcing the value bypasses the guard in any build);
+the .9 differential is rung 2.75's.
+
+**Wake-7 falsified models, preserved:**
+
+1. **"Nothing on paper suggests a threshold" (wake 6)** — FALSE: the
+   threshold is exactly `2^63`, and it is a cast boundary, not a scaling
+   effect. The wake-6 soak over `6x MAX` could never have found it; the
+   static sweep's "no consumer" conclusion was correct only below 2^63.
+2. **"The bogus shadow will be caught at the `in_file` branch
+   (`filter:1313`)"** — FALSE in this lab shape: over TLS the copy filter
+   has already turned the file buf into a memory buf, so the `in_memory`
+   branch (`:1307-1308`) runs. Cost: one probe run with a silent
+   breakpoint.
+3. **gdb command-file structural failure:** an edit that swallowed a
+   `continue`/`end` pair made gdb -batch parse the rest of the file as
+   command-list body and exit 0 after three breakpoints with no `run` —
+   no error text. Diagnosis cost one runner attempt; the runner's
+   port-wait timeout surfaced it.
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
@@ -404,14 +514,12 @@ memory corruption.
    (and `run-wu.sh 1.31.8 4` for the ASan soak) reproduce the full chain:
    `send_window` past MAX, guard underflow, unbounded credit; byte-identical
    across 2 runs. `run-wu.sh 1.31.9` reproduces the control GOAWAY.
-4. **Corruption attempt (rung 3) — CLOSED as a negative on this build, for
-   now:** the static consumer sweep found no allocation, length or index
-   derived from any window value, and the ASan soak over the fully-inflated
-   state (send_window ≈ 6x MAX, 36.7 MB streamed) produced zero reports.
-   The remaining rung-3 avenues (a consumer reachable only at extreme
-   window values, or a different build such as 32-bit) are named in the
-   open questions; on this 64-bit ASan build the accounting violation is
-   the final demonstrated finding.
+4. **Corruption attempt (rung 3) — DONE as a POSITIVE, debugger-assisted:
+   see "Extreme-window consumer".** `lab/harness/run-x.sh 1.31.8`
+   reproduces the confirmed heap buffer overflow (ASan report + worker
+   abort, byte-identical 2 runs): ledger forced to `2^63 + 2^32` after the
+   wire-proven pump. The wake-6 negative below 2^63 stands; no consumer
+   exists between `6x MAX` and `2^63 - 1`.
 5. **Control:** DONE — 1.31.9 rejects the over-credit probe (wake 4) and
    the interleave probe (wake 6) at the guard (`v2.c:2564/2565`, with
    `- h2c->send_queued` in the .9 guard).
@@ -424,12 +532,13 @@ memory corruption.
 | Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
 | Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0 |
-| Reproducible crash | NO | no fault in any run across wakes 4-6 |
-| Confirmed memory corruption | NO | static consumer sweep negative + ASan soak over send_window ≈ 6x MAX clean |
-| Demonstrated memory-safety impact (rung 4) | NO | the demonstrated impact is unbounded flow-control over-credit (protocol enforcement failure), not control of memory |
+| Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2, given the forced `2^63 + 2^32` ledger; the wire path to that ledger is proven to exist but was not pumped (~2^32 max-WUs) |
+| **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
 interleave finding of wake 6), the three falsified queueing models in
-"Falsified models", the wake-6 falsified models in the rung-2.75 section, and
+"Falsified models", the wake-6 falsified models in the rung-2.75 section, the
+wake-6 "no threshold on paper" model killed at 2^63 (rung-3 section), and
 the un-verified upstream-commit cross-check.
