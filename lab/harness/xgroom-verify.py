@@ -21,7 +21,8 @@ with the linear map canary_off = window_off + K constant inside each
 chunk and stepping between chunks (malloc headers, and the pump streams
 restart the file offset per stream). The verifier therefore does not
 require one global K: it checks (a) records are content-valid canary,
-(b) they form contiguous spans whose per-span K distribution is tight,
+(b) they form contiguous spans whose per-chunk byte map (canary_off -
+win_off) is exact, printed per step,
 (c) the pre-copy window is substantially sprayed, (d) post-copy NO
 canary magic survives below the stored extent, (e) content-valid
 records survive past it. Cross-run determinism of the geometry is
@@ -79,8 +80,8 @@ def spans_of(records):
         r["recs"].append((off, coff, valid))
     for r in out:
         r["valid"] = sum(1 for _, _, v in r["recs"] if v)
-        ks = Counter((coff - off) // REC for off, coff, _ in r["recs"])
-        r["ktop"], r["khits"] = ks.most_common(1)[0]
+        ks = Counter(coff - off for off, coff, _ in r["recs"])
+        r["steps"] = ks.most_common()
         r["can0"] = min(coff for _, coff, _ in r["recs"])
         r["can1"] = max(coff for _, coff, _ in r["recs"]) + REC
     return out
@@ -92,11 +93,14 @@ def show_spans(spans, tag, base=0):
         note = ""
         if n >= SPAN_MIN:
             note = "" if r["valid"] >= VALID_REQ * n else "  INVALID-CONTENT"
+        shown = ", ".join(f"{k - base:+#x} ({c}/{n})"
+                          for k, c in r["steps"][:4])
+        extra = f" +{len(r['steps']) - 4} more" if len(r["steps"]) > 4 else ""
         print(f"    {tag} span win[{r['start'] + base:#06x}.."
               f"{r['end'] + REC + base:#06x}] "
               f"canary[{r['can0']:#x}..{r['can1']:#x}] {n} recs, "
-              f"{r['valid']} valid, K~{r['ktop'] * REC:#x} "
-              f"({r['khits']}/{n}){note}")
+              f"{r['valid']} valid, steps canary_off-win_off: "
+              f"{shown}{extra}{note}")
 
 
 def verify(build, gdblog):
