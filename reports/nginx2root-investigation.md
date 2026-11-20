@@ -642,14 +642,68 @@ instruction executes. Consequences:
    named obstacle ("the 2^63 overshoot may fault before a useful object
    executes") is now an observed wall, not a risk.
 
-Per-build caveat, honestly labeled: this host is AMD Zen 3 (AVX2 only),
-so the IFUNC dispatcher selects `__memcpy_avx_unaligned_erms`; NGINX2Root's
-claimed profile is Debian 13, glibc 2.41, AVX-512 target. Whether the
-glibc 2.41 `__memmove_avx512_unaligned_erms` path orders its accesses
-differently (e.g. stores the head VEC before the tail load) is UNVERIFIED
-[INFERENCE from the shared template: likely the same tail-first order];
-checking it is the next Stage-A step. All rung-4 claims remain labeled for
-this lab's 1.31.8-plain build only.
+Per-build caveat, dispositioned at source level (wake 15, 2026-11-20):
+this host is AMD Zen 3 (AVX2 only), so the IFUNC dispatcher selects
+`__memcpy_avx_unaligned_erms` and the fault-context observation above is
+the EXECUTED path — and its fault instruction, `vmovdqu
+-0x20(%rsi,%rdx,1),%ymm5`, is exactly source line 461 of the template
+(finding 3 below) with VEC_SIZE = 32, which validates reading this template as a predictor of
+its built code. NGINX2Root's claimed profile is Debian 13, glibc 2.41,
+AVX-512 target, whose IFUNC pick would be
+`__memmove_avx512_unaligned_erms`. Checked by fetching the shipped glibc
+source (provisioning, allowed):
+
+```
+curl -fsSL -o glibc-2.41-memmove-vec-unaligned-erms.S \
+  'https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S;hb=glibc-2.41'
+```
+
+Findings, honestly labeled SOURCE-LEVEL STATIC evidence — the shipped
+`.S` template, not disassembled bytes of a Debian 2.41 build, and not
+executable on this host (no AVX-512 hardware) — one rung below the 2.39
+fault-context observation:
+
+1. `memmove-avx512-unaligned-erms.S` (2.41) is a 12-line wrapper that
+   includes `memmove-vec-unaligned-erms.S` with VEC_SIZE = 64 (evex512
+   vecs): the AVX-512 path IS the same template at a wider vector.
+2. The 2.41 template vs this host's 2.39 template differ ONLY in the
+   copyright-year line (unified diff verified; sha256 pinned below) —
+   the access ordering is byte-identical.
+3. In that template, for a wrapped `n ≥ 2^63` and canonical src, every
+   huge-length entry (`L(more_8x_vec)`, `L(movsb)`,
+   `L(large_memcpy_2x[_check])`) routes through megabyte-scale
+   threshold branches into a load-first block — forward
+   (`L(more_8x_vec_forward)`, line 461: the observed faulting tail load)
+   or backward (`L(more_8x_vec_backward)`, line 523: the same wrapped
+   tail load as its 4th access) — whose first non-canonical access is
+   the tail load `VMOVU -VEC_SIZE(%rsi, %rdx)`, strictly before the
+   first store (forward loop line 488 / backward line 540). The only
+   store-first fallthrough (`L(large_memcpy_2x)` line 695+) requires
+   `n ≤ src − dst`, impossible for `n ≥ 2^63` with canonical addresses
+   (`|src − dst| < 2^47`); the `rep movsb` tails are gated by the same
+   megabyte-scale thresholds, unreachable at exabyte `n`.
+
+So the wake-14 wall is STRUCTURAL, not calibration: no survivable
+wrapped length exists on glibc 2.39-AVX2 (executed, fault-observed) or
+on glibc 2.41-AVX-512 per its shipped template (displacement −0x40
+instead of −0x20, same non-canonical address). What this implies for
+NGINX2Root's claimed Debian-13/glibc-2.41/AVX-512 profile, without
+upgrading our ladder: the "partial copy before the fault" premise would
+need a different libc, a locally patched glibc, or a different consumer
+than the one observed here; the template glibc 2.41 actually ships
+cannot provide that window. Scope: this disposition covers the avx2 and
+avx512 instantiations of this template (all erms/non-erms variants it
+builds); the legacy SSE2 template was not checked — irrelevant to the
+claimed profile. All rung-4 claims remain labeled for this lab's
+1.31.8-plain build, extended by this static check only.
+
+Fetched-file sha256 (2026-11-20 evidence pin; copies under
+`lab/tmp/glibc-src/`, gitignored): 2.41 template
+`47926a9056c1805d9cd8109ef80e0c7f3a52f950e6ddec6a03dc10b6260848c1`,
+2.39 template
+`3cba1478f5b496e9be5d14e5a0fb5e5759fcef20423b570825843628f72329fb`
+(diff: copyright line only), avx512 wrapper (both tags)
+`4c6806b0c1ede898a790996d0b88bd3480953584ff526f1b04f567b8d68ecb65`.
 
 **Wake-14 falsified model, preserved:** "the raw glibc memcpy runs forward
 until it hits an unmapped page, overwriting everything between" — FALSE on
@@ -692,6 +746,9 @@ having written nothing.
    fault context of the wrapped memcpy: glibc's tail-VEC load from the
    wrapped non-canonical `src + n - 0x20` faults before any store, so the
    "partial copy" window is zero bytes on this build.
+   The glibc-2.41/AVX-512 extension of the negative is re-checkable
+   offline with the `curl` command quoted in the survey section (fetch
+   both tags, `diff -u`: only the copyright line differs).
 
 ## Evidence ledger
 
@@ -703,13 +760,16 @@ having written nothing.
 | **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0. Wake 9: wire-only pump (no debugger forcing) to 10,002,978,926,030 = 4658x MAX + 98,304, all 4693 credits accepted, author 1/1 + witness 1/1 (the earlier "2/2" was one run under two byte-identical log files, same worker PID 566660; witness run PID 624758), worker clean under ASan (`gdb-wu-1.31.8-1e13.log`, witness log `gdb-wu-1.31.8-4656-witness.log`) |
 | Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
-| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware; glibc 2.41 AVX-512 path UNVERIFIED |
+| Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
 interleave finding of wake 6), the three falsified queueing models in
 "Falsified models", the wake-6 falsified models in the rung-2.75 section, the
 wake-6 "no threshold on paper" model killed at 2^63 (rung-3 section), the
-wake-14 "progressive forward overwrite" model (Stage-A survey), and
+wake-14 "progressive forward overwrite" model (Stage-A survey), the
+wake-15 kill of the "glibc 2.41 AVX-512 might store first" hypothesis
+(shipped 2.41 template = 2.39's modulo copyright line — Stage-A
+survey), and
 the upstream-commit cross-check (witness-verified: six-line match, tag diff
 a superset — see "The patch").
