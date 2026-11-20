@@ -132,10 +132,11 @@ recorded here per the evidence discipline.
 
 **Open questions (UNKNOWN, each with a planned observation):**
 
-1. Does the cancellation route reach site 5 at all with unblocked unsent DATA
-   (RST_STREAM mid-response), and does the refund really stay 1:1 in the
-   running worker? → instrumented run of the cancellation sequence (next
-   wake).
+1. ~~Does the cancellation route reach site 5 at all with unblocked unsent
+   DATA (RST_STREAM mid-response), and does the refund really stay 1:1 in
+   the running worker?~~ **ANSWERED (wake 5):** yes it reaches the refund
+   loop synchronously via the terminate-cleanup path, and the refund is
+   byte-exactly 1:1 — see "Cancellation refund measurement".
 2. Is there a second credit path outside `src/http/v2/` that can inflate
    `h2c->send_window` (e.g. via `ngx_http_v2_adjust_windows`, `ngx_http_v2.c:5043`,
    which currently looks stream-only and sign-safe)? → grep for all writers
@@ -226,15 +227,74 @@ so the 1.31.8 guard never underflowed — the original NGINX2Root refund
 narrative stays refuted. No crash, no ASan report, no corruption: the ladder
 does not move past rung 1 + the observed accounting violation.
 
+## Cancellation refund measurement (wake 5, 2026-11-20 — rung 2.5 evidence)
+
+Harness: `lab/harness/rstprobe.py` (client), `lab/harness/run-rst.sh
+<build>` (starts the worker under gdb, `daemon off` + `follow-fork-mode
+child`), `lab/harness/gdb-rst.cmd` (breakpoints at the connection-WU credit
+`v2.c:2575`, PING-marker snapshots `state_ping`, the RST dispatch `v2.c:2184`,
+`close_stream` entry `v2.c:4704`, the queue-time charge `filter:1241` and the
+refund credit `filter:1767`).
+
+Probe shape: same setup as the over-credit probe (SETTINGS stream window MAX,
+connection WU W1, GET `/blob`), then 40 fresh GET streams on the blocked
+socket, RST_STREAM(CANCEL) on all 40, a second identical round with 40 more
+streams, and finally RST on stream 1 itself after ~43 MB have drained. PING
+markers snapshot `h2c->send_window` at each phase boundary.
+
+**Observed (2 runs, refund arithmetic byte-identical):**
+
+1. **The refund site fires — synchronously, at RST processing time.** Call
+   chain from the worker debug log: `state_rst_stream` sets `fc->error`
+   (`v2.c:2182`) and invokes `fc->read->handler` (`v2.c:2204-2205`) →
+   `ngx_http_request_handler` → `ngx_http_test_reading` → "client
+   prematurely closed connection" → finalize 499 → `ngx_http_terminate_request`
+   → the request cleanup handlers, including `ngx_http_v2_filter_cleanup`
+   (`filter:1700`). A static hypothesis that `close_stream`'s
+   queued-!=-0 postponement (`v2.c:4721`) would make the refund unreachable
+   while socket-blocked was **falsified**: the refund runs via the terminate
+   cleanup BEFORE `close_stream` even completes; `close_stream`'s entry
+   breakpoint then shows `queued=1` (the stream's blocked HEADERS frame,
+   created `blocked=1`, never refunded — consistent with the pinned facts
+   above).
+2. **The refund is exactly 1:1.** Each fresh stream charged 8 DATA frames ×
+   8192 = 65,536 at queue time (CHARGE lines, `filter:1241`); each
+   cancellation refunded exactly 65,536 (delta of consecutive REFUND/RST
+   snapshots at `filter:1767`). Round 1: `send_window` 2,142,666,751 →
+   2,145,288,191 across 40 RSTs — byte-exactly the pre-charge baseline
+   (marker mk00 == post-RST marker, both runs). Round 2: identical. Stream 1,
+   cancelled after ~43 MB had drained: refunded 32,768 = its 4 remaining
+   queued-unsent 8K DATA charges. No refund in either run exceeded the sum of
+   its stream's charges; `send_window` never exceeded its baseline, let alone
+   `NGX_HTTP_V2_MAX_WINDOW`; the 1.31.8 guard never underflowed.
+
+**Verdict:** NGINX2Root's narrative — "repeated cancellations refund
+`send_window` past 0x7fffffff so the guard underflows and a WINDOW_UPDATE
+over-credits the connection" — is refuted at runtime on 1.31.8, on top of
+the static refutation: 81 cancellations across 2 runs (80 fresh streams +
+the blob stream), every refund byte-exact against its queue-time charges.
+Combined with wake 4 (the refund never inflated `send_window`, and the
+observed over-credit is the queued-DATA shape the 1.31.9 guard closes), the
+CVE's claimed mechanism has no observed support on either ledger: neither
+the refund path nor the WU-guard path drives `h2c->send_window` past MAX.
+
+Negative results preserved from this wake: my own postponement model
+(refund unreachable while blocked) — falsified by the REFUND hits; probe bug
+found and fixed (PING must be exactly 8 bytes; 4-byte markers drew
+FRAME_SIZE_ERROR and a GOAWAY, `NGX_HTTP_V2_PING_SIZE`, `v2.c:34`); a runner
+cleanup gap (a probe failure used to strand the worker holding port 8443,
+invalidating one run — now a trap in `run-rst.sh`).
+
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
    harness reproduces it from a clean checkout (plus `openssl req` and one
    `dd` for the gitignored cert/corpus, see `lab/provision.sh` comments).
-2. **Cancellation refund measurement (NEXT):** same harness, RST_STREAM
-   mid-flight on a stream with queued-unsent DATA; log every
-   `h2c->send_window += window` (site 6) with before/after; verify the 1:1
-   refund or find the divergence the paper analysis missed.
+2. **Cancellation refund measurement — DONE, see "Cancellation refund
+   measurement".** 81 cancellations across 2 runs, every refund byte-exact
+   (65,536 per fresh stream = 8×8192 charged; round aggregates return
+   `send_window` exactly to baseline). NGINX2Root's refund-inflation
+   narrative: refuted at runtime.
 3. **Corruption attempt (rung 3):** with the over-credit now observed, hunt
    the consumer that turns an over-committed window into a memory fault
    (allocation or length sized by window arithmetic) and drive it under
@@ -247,7 +307,7 @@ does not move past rung 1 + the observed accounting violation.
 | Ladder rung | Status | Evidence |
 |---|---|---|
 | Suspected vulnerability | YES | patch diff + fault sites above |
-| Accounting violation observed (protocol window over-committed past 2^31-1) | YES | gdb memory read: post-credit `send_window + queued` = 2,148,311,039 > MAX; .9 rejects the same WU at 2,145,689,599 (`send_window + send_queued`) |
+| Cancellation refunds exactly 1:1 (no inflation, guard never underflowed) | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges exactly; `send_window` never above baseline; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
 | Reproducible crash | NO | no fault in any run; worker stayed healthy through 3 runs/build |
 | Confirmed memory corruption | NO | — |
 | Demonstrated security impact | NO | — |
