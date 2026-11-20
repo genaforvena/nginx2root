@@ -1,10 +1,13 @@
 # NGINX2Root / CVE-2026-123007 — nginx HTTP/2 flow-control investigation
 
-Status: **suspected vulnerability, with the flow-control accounting violation
-now OBSERVED at runtime** (see "Observed over-credit" below). No crash and no
-memory corruption yet — ladder rungs 3-4 remain unfounded. Every claim below
-is either cited to `file:line` in the extracted 1.31.8 tree, backed by
-observed worker bytes (log lines / gdb memory reads), or marked UNKNOWN.
+Status: **demonstrated unbounded connection-window over-credit (the exact
+ledger state NGINX2Root claims) on the affected build, with the patched build
+refusing it — but no memory corruption**: `h2c->send_window` was driven past
+`NGX_HTTP_V2_MAX_WINDOW` to ~12.9 billion (6x the RFC ceiling) and the guard
+underflowed exactly as claimed, with zero ASan/UBSan findings (rung 2.75
+below). Every claim is either cited to `file:line` in the extracted 1.31.8
+tree, backed by observed worker bytes (log lines / gdb memory reads), or
+marked UNKNOWN.
 
 ## Scope and method
 
@@ -110,25 +113,29 @@ queued-unsent frames. The guard lets the client drive `P` past the RFC 7540
 detector: over-credit `h2c->send_window + Q > 2^31-1` while the connection
 window's bookkeeping stays "legal".
 
-**Refuted on paper (as far as static reading goes):** NGINX2Root's claimed
-mechanism — "repeated cancellations refund `send_window` past 0x7fffffff, so
-the guard `MAX_WINDOW - send_window` underflows and a WINDOW_UPDATE
-over-credits the connection" — does **not** hold via the sites it names:
+**Partially refuted on paper, then CONFIRMED at runtime with the missing
+ingredient (wake 6):** NGINX2Root's claimed mechanism — "repeated
+cancellations refund `send_window` past 0x7fffffff, so the guard
+`MAX_WINDOW - send_window` underflows and a WINDOW_UPDATE over-credits the
+connection" — is right about the ledger state and the underflow, wrong about
+the route:
 
 - the only unguarded credit (site 6) refunds DATA frames 1:1 against their
-  queue-time charges (see pinned facts above);
-- all non-DATA frames of the stream are `blocked = 1` in 1.31.8 and skipped
-  by the refund loop (site 7), so "uncharged headers/trailers refunds" do
-  not exist either;
-- therefore no static path was found by which `h2c->send_window` itself
-  exceeds `NGX_HTTP_V2_MAX_WINDOW`, and without that the 1.31.8 guard does
-  not underflow.
-
-This refutation is a claim about *my reading*, not about the binary: the next
-rung must measure the actual accounting (instrument the worker or read the
-debug log) before any stronger conclusion. A synthetic tree may also differ
-from upstream intent; runtime behavior is the arbiter. Failed hypotheses stay
-recorded here per the evidence discipline.
+  queue-time charges (confirmed at runtime, wake 5), and all non-DATA
+  frames of the stream are `blocked = 1` in 1.31.8, skipped by the refund
+  loop (site 7) — so neither repeated cancellation alone (wake 5: 81
+  refunds, baseline-exact) nor phantom uncharged frames drive
+  `send_window` past MAX;
+- **but** a connection WU granted *between* a stream's queue-time charge
+  and its cancellation re-fills the same bytes the refund later credits:
+  the guard (site 1) evaluates the post-charge value, the refund (site 6)
+  is unguarded, so each charge→WU→RST interleave nets +charge on the
+  connection ledger. 33 interleaves drive `h2c->send_window` past
+  `NGX_HTTP_V2_MAX_WINDOW` (observed MAX + 32,768), the guard expression
+  underflows, and every further WU is accepted — see "WU-interleave
+  double-credit and connection-window underflow". My wake-5 conclusion
+  that no path drives `send_window` past MAX was FALSE; it assumed WUs
+  never interleave with the charge/refund pair.
 
 **Open questions (UNKNOWN, each with a planned observation):**
 
@@ -149,9 +156,15 @@ recorded here per the evidence discipline.
    line) before trusting my reading of it either way.
 4. Where, if anywhere, does an over-credited window become a memory-safety
    fault (allocation sized by a window, or a size_t wrap consumed by a
-   length)? Nothing found on paper in `src/http/v2/`; this is the gap between
-   "accounting violation" and "memory corruption", and it is the difference
-   between rung 2 and rung 4. Do not upgrade the ladder without ASan bytes.
+   length)? **NEGATIVE on this build so far (wake 6):** the static consumer
+   sweep found no window-derived allocation, length or index anywhere the
+   over-credit reaches, and the ASan soak over `send_window ≈ 6x MAX`
+   with 36.7 MB streamed produced zero reports. Untried avenues: extreme
+   window values beyond 6x MAX (no code path scales with the value —
+   nothing on paper suggests a threshold), a 32-bit build (where
+   `MAX_WINDOW - send_window` truncates differently), or consumers in
+   third-party/vendored filter modules. Do not upgrade the ladder without
+   ASan bytes.
 
 ## Observed over-credit (wake 4, 2026-11-20 — rung-2 evidence)
 
@@ -285,6 +298,97 @@ FRAME_SIZE_ERROR and a GOAWAY, `NGX_HTTP_V2_PING_SIZE`, `v2.c:34`); a runner
 cleanup gap (a probe failure used to strand the worker holding port 8443,
 invalidating one run — now a trap in `run-rst.sh`).
 
+## WU-interleave double-credit and connection-window underflow (wake 6, 2026-11-20 — rung 2.75 evidence)
+
+Harness: `lab/harness/wuprobe.py` (client), `lab/harness/run-wu.sh <build>
+[soak]` (worker under gdb, same launch pattern as run-rst.sh),
+`lab/harness/gdb-wu.cmd` (breakpoints: the connection-WU credit `v2.c:2575`,
+PING-marker snapshots, the queue-time charge `filter:1241`, the refund credit
+`filter:1767`).
+
+**The mechanism (all numbers observed in worker bytes, 2 runs,
+byte-identical).** One pump cycle sends HEADERS(stream n) + connection
+WU(65536) + RST(n) in a single segment; the worker processes them in wire
+order:
+
+1. charge -65536 at queue time (`filter:1241`) — `R -> R - 65536`;
+2. WU +65536 (`v2.c:2575`) — the guard at `v2.c:2564` evaluates the
+   **post-charge** value, so it only enforces `R <= MAX`, never seeing the
+   refund that follows;
+3. refund +65536 (`filter:1767`, unguarded) — lands **on top of the WU
+   refill**, `R_{n+1} = R_n + 65536` per cycle.
+
+The refund is still 1:1 against its stream's charges (wake 5 holds); the
+double-credit is on the **connection ledger**: the WU re-filled what the
+charge took, and the refund credits it again. From baseline
+`R_0 = MAX - 2,195,456` (the blob's queue-time charge, mkA0), 33 cycles
+drive `R` to **mkB1 = 2,147,516,415 = MAX + 32,768**: `h2c->send_window`
+above `NGX_HTTP_V2_MAX_WINDOW` — the ledger state NGINX2Root claims, now
+observed (also visible in the worker's own `http2:71 windows: conn:2147516415`
+debug line).
+
+A cycle WU never sees `R > MAX` (it evaluates post-charge, and cycle 33's WU
+at `MAX - 32768` is correctly rejected). The underflow needs a **standalone
+WU arriving after the refund and before the next charge**, while
+`R > MAX`:
+
+```
+CONNWU inc=65536 send_window(pre)=2147516415     <- pre > MAX: guard RHS wrapped
+PINGMARK mkC1 = 2147581951                        = MAX + 98,304
+CONNWU inc=2147483647 send_window(pre)=2147581951 <- a full 2^31-1 increment
+PINGMARK mkC2 = 4295065598                        ≈ 2x MAX
+```
+
+With the guard expression `MAX - send_window` (64-bit `size_t`) wrapped,
+every further WINDOW_UPDATE of any legal size is accepted: a soak run with 4
+extra max-size WUs drove `send_window` to **12,885,000,186 ≈ 6x MAX**
+(mkS9), after which the connection streamed 36.7 MB of the blob with no
+GOAWAY, no EOF, all 8 PING markers answered, and **zero ASan/UBSan reports**
+beyond the pre-existing benign misaligned-store noise. The client had pushed
+cumulative accepted WU increments of ~12.9 GB through a 2^31-1 ceiling.
+
+**Control (1.31.9, identical probe):** the very first cycle WU is refused —
+"client violated connection flow control: received WINDOW_UPDATE frame
+with window increment 65536 not allowed for window 2147442687" (the value
+is `send_window + send_queued` per the .9 guard, `v2.c:2564`), GOAWAY
+(FLOW_CONTROL_ERROR), EOF, zero pongs. The patched guard closes the
+interleave from the first cycle; the pump never starts.
+
+**What this does and does not show.** Demonstrated (rung 2.75): a
+deterministic client-only input sequence that (a) pushes the connection
+send window past the RFC 7540 §6.9.1 ceiling, (b) underflows the 1.31.8
+guard exactly as NGINX2Root claims, and (c) converts that into unbounded
+window credit on the live connection, with the patched build refusing the
+same sequence. NOT shown: any memory fault. The static consumer sweep this
+wake found no allocation, length or index ever derived from a window value
+(`limit` in `ngx_http_v2_send_chain` only slices real buffer extents via
+`ngx_http_v2_filter_get_shadow`, `filter:1144-1260`; the grpc/proxy v2
+modules keep their own separate ledgers; gating uses `== 0` / `> 0`
+checks), and the ASan soak over the fully-inflated state stayed clean.
+Rungs 3-4 remain unfounded; on this 64-bit ASan build the demonstrated
+impact is a protocol-enforcement failure (unbounded over-credit), not
+memory corruption.
+
+**Wake-6 falsified models, preserved:**
+
+1. **"Wake 5 closed the door: refunds are 1:1 so `send_window` can never
+   exceed MAX"** — FALSE as a conclusion, TRUE as an observation: the refund
+   is 1:1 against its own stream's charges, but a WU granted between the
+   charge and the RST re-fills the same bytes first; the unguarded refund
+   then double-credits the connection ledger. Wake 5's probe never
+   interleaved a WU, so it could not see this.
+2. **"The cycle WU will trigger the underflow once R crosses MAX"** —
+   FALSE: the guard evaluates post-charge, at `R - 65536 <= MAX`; the first
+   probe attempt pumped one cycle too far (34 cycles), the 34th cycle's WU
+   was correctly rejected at `MAX - 32768`, and the connection died before
+   the standalone underflow WU could be sent. The crossing cycle count is
+   load-bearing: 33 cycles leave `R = MAX + 32768` for the standalone WU.
+3. **"Any refund inflation would need a non-DATA frame in the refund loop"**
+   — FALSE and unnecessary: server-sent WU/RST/GOAWAY frames queue blocked
+   (`v2.c:2906/2933/2960`), HEADERS/TRAILERS are `blocked = 1`
+   (`filter:864`), so only DATA frames are ever refunded in 1.31.8 — the
+   double-credit needs the interleave, not a phantom uncharged frame.
+
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
@@ -293,25 +397,39 @@ invalidating one run — now a trap in `run-rst.sh`).
 2. **Cancellation refund measurement — DONE, see "Cancellation refund
    measurement".** 81 cancellations across 2 runs, every refund byte-exact
    (65,536 per fresh stream = 8×8192 charged; round aggregates return
-   `send_window` exactly to baseline). NGINX2Root's refund-inflation
-   narrative: refuted at runtime.
-3. **Corruption attempt (rung 3):** with the over-credit now observed, hunt
-   the consumer that turns an over-committed window into a memory fault
-   (allocation or length sized by window arithmetic) and drive it under
-   ASan; nothing found on paper yet, so this may end in a honest negative.
-4. **Control:** DONE as part of 1 — 1.31.9 rejects every attempt at the
-   guard (`v2.c:2564/2565`).
+   `send_window` exactly to baseline) — **without an interleaving WU**;
+   see rung 2.75 for what changes when one is present.
+3. **WU-interleave double-credit — DONE, see "WU-interleave double-credit
+   and connection-window underflow".** `lab/harness/run-wu.sh 1.31.8`
+   (and `run-wu.sh 1.31.8 4` for the ASan soak) reproduce the full chain:
+   `send_window` past MAX, guard underflow, unbounded credit; byte-identical
+   across 2 runs. `run-wu.sh 1.31.9` reproduces the control GOAWAY.
+4. **Corruption attempt (rung 3) — CLOSED as a negative on this build, for
+   now:** the static consumer sweep found no allocation, length or index
+   derived from any window value, and the ASan soak over the fully-inflated
+   state (send_window ≈ 6x MAX, 36.7 MB streamed) produced zero reports.
+   The remaining rung-3 avenues (a consumer reachable only at extreme
+   window values, or a different build such as 32-bit) are named in the
+   open questions; on this 64-bit ASan build the accounting violation is
+   the final demonstrated finding.
+5. **Control:** DONE — 1.31.9 rejects the over-credit probe (wake 4) and
+   the interleave probe (wake 6) at the guard (`v2.c:2564/2565`, with
+   `- h2c->send_queued` in the .9 guard).
 
 ## Evidence ledger
 
 | Ladder rung | Status | Evidence |
 |---|---|---|
 | Suspected vulnerability | YES | patch diff + fault sites above |
-| Cancellation refunds exactly 1:1 (no inflation, guard never underflowed) | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges exactly; `send_window` never above baseline; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
-| Reproducible crash | NO | no fault in any run; worker stayed healthy through 3 runs/build |
-| Confirmed memory corruption | NO | — |
-| Demonstrated security impact | NO | — |
+| Observed accounting violation (true window > MAX via queued-DATA ledger gap) | YES | wake 4: gdb `post_true = 2,148,311,039 > MAX`; 1.31.9 rejects the same WU |
+| Cancellation refunds exactly 1:1 **without an interleaving WU** | YES | 81 refunds across 2 runs: per-stream refund == queue-time charges; `close_stream` postponement does not gate the refund (terminate-cleanup path) |
+| **`h2c->send_window` itself driven past MAX; 1.31.8 guard underflowed; unbounded WU credit accepted** | **YES** | wake 6: mkB1 = MAX + 32,768; standalone WU accepted at pre = 2,147,516,415; `inc=2147483647` accepted; soak to 12,885,000,186 with 36.7 MB streamed, no GOAWAY; byte-identical 2 runs; 1.31.9 refuses the same sequence at cycle 0 |
+| Reproducible crash | NO | no fault in any run across wakes 4-6 |
+| Confirmed memory corruption | NO | static consumer sweep negative + ASan soak over send_window ≈ 6x MAX clean |
+| Demonstrated memory-safety impact (rung 4) | NO | the demonstrated impact is unbounded flow-control over-credit (protocol enforcement failure), not control of memory |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
-the refund-inflation narrative above, the three falsified queueing models in
-"Falsified models", and the un-verified upstream-commit cross-check.
+the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
+interleave finding of wake 6), the three falsified queueing models in
+"Falsified models", the wake-6 falsified models in the rung-2.75 section, and
+the un-verified upstream-commit cross-check.
