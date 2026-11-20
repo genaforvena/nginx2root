@@ -709,6 +709,72 @@ Fetched-file sha256 (2026-11-20 evidence pin; copies under
 until it hits an unmapped page, overwriting everything between" — FALSE on
 this build: it faults on its second access, a wrapped-address tail load,
 having written nothing.
+
+## Stage-A-mechanics: store-first memcpy under LD_PRELOAD (wake 15, 2026-11-20 — SYNTHETIC, mechanics-only, owner directive #47)
+
+Owner approval (#47, 2026-11-20): run the previously flagged,
+NOT-stock route — LD_PRELOAD a store-first memcpy into the plain build
+— with this label discipline, kept verbatim: the memcpy is SYNTHETIC;
+the stock-glibc result stands unwalled (2.39-AVX2 tail-first, zero
+stores, fault-context evidence); NO rung-4 claim on any stock build
+may come from it; evidence is graded mechanics-only. What it may
+establish is the placement half of Stage A: whether nginx-side heap
+mechanics place chosen bytes at computable offsets relative to the SSL
+send-chain destination. What it cannot establish: anything about
+stock glibc, and a stock-build rung-4 claim would still need a
+store-first consumer on an executable profile, which no build this lab
+can run provides (2.39 executed wall, 2.41 static wall).
+
+Harness (committed): `lab/harness/storefirst-memcpy.c` (interposed
+`memcpy`/`memmove`; lengths `< 2^40` delegate to real glibc, only a
+wrapped length takes a naive store-first forward byte loop; progress
+counter `g_mech_bytes`), `lab/harness/gdb-x-mechanics.cmd` (same
+forced-ledger sequence as the survey; breaks on the shim's `storefirst`
+symbol — pending-breakpoint, since the preload maps only at exec —
+because the nginx-side `ngx_ssl_send_chain` entry break never fires on
+this -O1 build, the wake-14 defect), `lab/harness/run-x-mechanics.sh`
+(builds `lab/tmp/storefirst-memcpy.so` itself, own log names).
+
+**Observed (2 successful runs, byte-identical fault context; dumps from
+the second):** the wrapped call `n = 2^63 + 2^32` executes the
+store-first loop with `dst = 0x555555779b4a` (the SSL buffer's fill
+point `buf->last`), `src = 0x555555a25630` (stream 71's DATA frame
+body, a 32 KiB file chunk), and stores forward from `dst` until the
+READ side faults at `0x555555a43000` — `si_code = 1 (SEGV_MAPERR)`
+with a canonical `si_addr`, the predicted contrast with stock glibc's
+`si_code = 128 (SI_KERNEL)`, `si_addr = 0`. Extent read from the shim
+counter: `g_mech_bytes = 118,784` (progress lags the fault by < 4 KiB;
+fault at src + 121,296, a heap-region boundary). Content, verified
+offline against the 64 MiB urandom corpus (`lab/tmp/x-mechanics-*.bin`):
+
+1. **Faithful copy:** the first 32 KiB stored at `dst` equals the frame
+   body byte-for-byte, and the frame body equals `blob[0:32768]` (file
+   offset 0 — each probe stream GETs `/blob` from the start).
+2. **Chosen bytes past the SSL buffer:** the chosen (fully known,
+   provisioning-controlled) blob span covers `dst+0 .. dst+0x8000`; the
+   16 KiB buffer ends at `b->end ≤ dst+0x4000`, so at least
+   `dst+0x4000 .. dst+0x8000` — 16 KiB immediately past the buffer's
+   chunk — received chosen file bytes. The dumped victims window
+   (`dst+0x4000 .. dst+0xC000`) changed 32,640/32,768 bytes against its
+   pre-copy dump.
+3. **Beyond the frame chunk the copy stores heap noise:** the wrapped
+   `src` is only 32 KiB of real file data; `src[0x8000..]` is whatever
+   heap bytes follow the chunk, and those land at
+   `dst+0x8000 .. dst+~0x1E000` too — overwritten, but NOT chosen
+   content. (The `ovw-src` dump command failed because its range
+   crossed the fault address — full-extent verification used the blob
+   file as ground truth instead.)
+
+Mechanics conclusion, honestly scoped: under a synthetic store-first
+memcpy, nginx's own queue/copy path delivers ≥16 KiB of chosen bytes to
+a deterministic window immediately past the 16 KiB SSL buffer, plus
+~86 KiB of non-chosen heap noise beyond it, and the worker then dies
+on the read side — placement-mechanics POSITIVE for the chosen-byte
+half. What remains unexercised: heap GROOMING (spraying a victim
+object to a chosen offset in that window) — the next mechanics slice if
+directed; and any stock-build claim remains walled as above. Ladder
+unchanged: rung 4 NO.
+
 ## Reproduction plan (rungs, in order)
 
 1. **Accounting probe — DONE, see "Observed over-credit".** The committed
@@ -749,6 +815,12 @@ having written nothing.
    The glibc-2.41/AVX-512 extension of the negative is re-checkable
    offline with the `curl` command quoted in the survey section (fetch
    both tags, `diff -u`: only the copyright line differs).
+7. **Stage-A-mechanics (SYNTHETIC, owner directive #47) — DONE as a
+   mechanics POSITIVE for the chosen-byte half: see "Stage-A-mechanics".**
+   `lab/harness/run-x-mechanics.sh 1.31.8-plain` (builds the shim itself)
+   reproduces the store-first copy: chosen blob bytes at deterministic
+   offsets past the SSL buffer, read-side SEGV_MAPERR stop, offline
+   verification against `lab/corpus/blob`.
 
 ## Evidence ledger
 
@@ -761,6 +833,7 @@ having written nothing.
 | Reproducible crash (debugger-assisted ledger) | YES | wake 7: worker aborts (ASan `ABORTING`, exit 1) on every `run-x.sh 1.31.8` run, 2/2 + witness 3/3; on the unsanitized build the same probe SIGSEGVs the worker in real glibc memcpy (witness 3/3 + author 1/1, `run-x-plain.sh`); the wire path to that ledger is wire-pumped to 10^13 (wake 9, 4658x MAX) and the remaining ~2^32-WU stretch to 2^63 was skipped by the debugger |
 | **Confirmed memory corruption (rung 3)** | **YES** | wake 7: ASan `memcpy-param-overlap`, `2^63+2^32`-byte memcpy into a 16 KiB heap buf (`ngx_event_openssl.c:3150` via `v2.c:544`); full chain breakpoint-observed: negative `(off_t)` cast (`filter:1144`), wrapped `frame_size` (`:1165`), bogus shadow (`:1308`), huge charge (`:1241`); 2 byte-identical runs + witness 3/3 + plain-build SIGSEGV 4/4. Consumer code identical in 1.31.9 — the patch blocks the ledger, not the consumer |
 | Demonstrated memory-safety impact (rung 4) | NO | no control over the overflow's contents/placement beyond length; the 2^63 ledger was debugger-forced, not wire-pumped (wire-pumped to 10^13, ~922,000x short of 2^63). Wake 14: on the plain build the wrapped memcpy performs ZERO stores before faulting (glibc tail-VEC load wall, see "Stage-A survey") — Stage A's canary placement via the partial copy is unreachable on this glibc/hardware. Wake 15: glibc 2.41's shipped AVX-512 template differs from 2.39's only in its copyright line, same tail-load-first order — the wall is structural on both the executed 2.39-AVX2 path and the claimed 2.41-AVX-512 profile (source-level static evidence, one rung below the fault-context observation; not executable on this host). **Stage B (wire-pure 2^63 pump, ~2^32 max-WUs ≈ 56 GB loopback) NOT RUN — open owner question, not a lab blocker:** its only consumer (Stage C) has no write to hijack on any build this lab can execute, and its residual value is upgrading rung 3 from debugger-assisted to wire-pure; a stage that fails is preserved as a negative, not retried into existence (docs/task.md) |
+| Stage-A-mechanics (SYNTHETIC LD_PRELOAD store-first memcpy, owner #47; NOT a rung-4 claim) | mechanics POSITIVE, chosen-byte half | wake 15: under the shim the wrapped copy stores 118,784+ bytes from `buf->last`; ≥16 KiB of chosen blob content lands deterministically immediately past the 16 KiB SSL buffer (verified byte-exact against the corpus), read-side SEGV_MAPERR at the heap boundary; grooming of a victim to a chosen offset NOT yet exercised — see "Stage-A-mechanics" |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
 the naive refund-inflation narrative (wake 5 — superseded, not erased, by the
