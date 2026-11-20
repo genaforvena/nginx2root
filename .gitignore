@@ -8,6 +8,7 @@ lab/build/
 lab/corpus/
 lab/ssl/
 lab/tmp/
+lab/logs/
 
 # Rust / Python build output
 target/

@@ -1,9 +1,10 @@
 # NGINX2Root / CVE-2026-123007 — nginx HTTP/2 flow-control investigation
 
-Status: **suspected vulnerability** (evidence ladder rung 1 of 4). No trigger has
-been run yet. This report records the patch-level (paper) analysis, the builds,
-and the exact next experiment; every claim below is either cited to
-`file:line` in the extracted 1.31.8 tree, or explicitly marked UNKNOWN.
+Status: **suspected vulnerability, with the flow-control accounting violation
+now OBSERVED at runtime** (see "Observed over-credit" below). No crash and no
+memory corruption yet — ladder rungs 3-4 remain unfounded. Every claim below
+is either cited to `file:line` in the extracted 1.31.8 tree, backed by
+observed worker bytes (log lines / gdb memory reads), or marked UNKNOWN.
 
 ## Scope and method
 
@@ -151,37 +152,106 @@ recorded here per the evidence discipline.
    "accounting violation" and "memory corruption", and it is the difference
    between rung 2 and rung 4. Do not upgrade the ladder without ASan bytes.
 
+## Observed over-credit (wake 4, 2026-11-20 — rung-2 evidence)
+
+Harness (all committed under `lab/`): `lab/conf/nginx-h2.conf` (one worker,
+`listen 127.0.0.1:8443 ssl; http2 on;`, debug log), `lab/harness/h2probe.py`
+(hand-rolled HTTP/2 client, binds 127.0.0.1 only), `lab/harness/run-probe.sh`
+(start one build, run the probe, rotate the log to `lab/tmp/probe-<v>.log`).
+
+Reproduce: `lab/harness/run-probe.sh 1.31.8` and `lab/harness/run-probe.sh
+1.31.9`. Probe shape: SETTINGS with stream window `2^31-1`; connection WU
+`2^31-1 - 65535` (→ `send_window = MAX`); GET `/blob` (64 MiB); after the
+first burst blocks the socket, open 100 fresh GET streams (each new
+`send_chain` charges one 32 KiB chunk at queue time and its flush fails on
+the full socket); then one connection WU of 2,621,440 bytes.
+
+**Observed, 1.31.8 (affected), 3 runs, deterministic:** the WU is accepted
+and the connection keeps streaming. Worker memory read via gdb at the credit
+site (`break ngx_http_v2.c:2575`, worker launched under gdb; log excerpt
+`lab/tmp/gdb-wu.log`):
+
+```
+CONNWU window=2147418112 send_window(pre)=65535 queued_data=0 post_true=2147483647
+CONNWU window=2621440 send_window(pre)=2139095039 queued_data=6594560 post_true=2148311039
+```
+
+`post_true = send_window + queued DATA` = 2,148,311,039 > NGX_HTTP_V2_MAX_WINDOW
+(2,147,483,647) by 827,392 bytes: the true protocol window is over-committed
+past the RFC ceiling while the worker's own guard saw only
+`send_window = 2,139,095,039` and its bookkeeping stayed "legal".
+
+**Observed, 1.31.9 (control), 3 runs:** the identical WU is rejected —
+`probe-1.31.9.log`: "client violated connection flow control: received
+WINDOW_UPDATE frame with window increment 2621440 not allowed for window
+2145689599" (that value is `send_window + send_queued` per the .9 guard,
+`v2.c:2564/2570`: 2,139,095,039 + 6,594,560) — followed by
+GOAWAY(FLOW_CONTROL_ERROR) and connection close. The client-side
+differential (`over_credit_accepted` in the probe JSON): 1.31.8 `true`
+(no GOAWAY, no EOF, 16.7 MB more DATA streamed), 1.31.9 `false`
+(`conn_eof: true`, worker closed without flushing the queued GOAWAY).
+The control's `send_queued` (6,594,560) is byte-identical to the queue
+the gdb read summed in the 1.31.8 worker — cross-validated.
+
+### Falsified models (preserved per evidence discipline)
+
+Three paper models died in this wake's runs; each is recorded with the
+observation that killed it:
+
+1. **"The whole 64 MiB queues in one `send_chain` call"** — FALSE. Static
+   file reads are capped at ~2 MiB per wake cycle ("http write filter limit
+   2097152", `ngx_http_write_filter_module.c:297`); a single-shot
+   64 MB WU was correctly rejected with only 1,966,080 bytes charged
+   (`probe-1.31.8.log`, first probe run).
+2. **"Accepted connection WUs pump more file into the queue"** — FALSE. The
+   stream is socket-blocked, not flow-control-blocked, so it is not in
+   `h2c->waiting` and the WU wake loop (`v2.c:2577-2598`) never re-runs it.
+   Observed: pump1 (1.8 MB) accepted, pump2 rejected with headroom reduced to
+   exactly the pump size.
+3. **"Single-stream suffices"** — the working shape is NGINX2Root's
+   multi-stream one: each NEW stream runs its own `send_chain` and charges
+   one 32 KiB chunk before its flush fails on the full socket; 100 streams
+   built 8,388,608 bytes charged / 6,594,560 queued-unsent.
+
+Environment facts measured on this host: a loopback socket absorbs
+~1.79 MB unread before blocking (measured: 1,792,000 bytes with
+SO_RCVBUF=8192; server sndbuf autotunes to 2.6 MB and the advertised client
+window is not enforced on this host's loopback). UBSan emits pre-existing
+benign misaligned-store reports in nginx's frame serialization
+(`v2.c:2837-2904`, `v2.c:892-897`) — not CVE-related, non-fatal.
+
+What this does NOT show: `h2c->send_window` itself never exceeded MAX in any
+run (max observed 2,147,483,647 after W1, 2,141,716,479 after the final WU),
+so the 1.31.8 guard never underflowed — the original NGINX2Root refund
+narrative stays refuted. No crash, no ASan report, no corruption: the ladder
+does not move past rung 1 + the observed accounting violation.
+
 ## Reproduction plan (rungs, in order)
 
-1. **Accounting probe (rung 1→2):** loopback TLS + h2 instance of
-   `lab/build/1.31.8`, one worker, debug log; client opens a stream for a
-   multi-MiB static file, exhausts the stream window so DATA accumulates
-   queued-unsent, keeps sending connection WINDOW_UPDATEs sized to pass the
-   1.31.8 guard, and observes — via the worker debug log / a
-   `send_queued`-equivalent instrumentation patch — whether the committed
-   window exceeds `2^31-1`. Detector: our own accounting of
-   `send_window + queued` mirrored from the debug log.
-2. **Cancellation refund measurement:** same harness, RST_STREAM mid-flight;
-   log every `h2c->send_window +=` (site 6) with before/after values; verify
-   1:1 or find the divergence the paper analysis missed.
-3. **Corruption attempt (rung 3):** only after 1-2 produce observed over-credit
-   bytes, drive the sequence under ASan and let the detector speak.
-4. **Control:** every positive re-run against `lab/build/1.31.9` must show the
-   guard rejecting the increment (log line "client violated connection flow
-   control", `ngx_http_v2.c:2565-2572`).
-
-Harness details (cert, corpus, conf) will be committed under `lab/` as they
-are built; the client binds 127.0.0.1 only.
+1. **Accounting probe — DONE, see "Observed over-credit".** The committed
+   harness reproduces it from a clean checkout (plus `openssl req` and one
+   `dd` for the gitignored cert/corpus, see `lab/provision.sh` comments).
+2. **Cancellation refund measurement (NEXT):** same harness, RST_STREAM
+   mid-flight on a stream with queued-unsent DATA; log every
+   `h2c->send_window += window` (site 6) with before/after; verify the 1:1
+   refund or find the divergence the paper analysis missed.
+3. **Corruption attempt (rung 3):** with the over-credit now observed, hunt
+   the consumer that turns an over-committed window into a memory fault
+   (allocation or length sized by window arithmetic) and drive it under
+   ASan; nothing found on paper yet, so this may end in a honest negative.
+4. **Control:** DONE as part of 1 — 1.31.9 rejects every attempt at the
+   guard (`v2.c:2564/2565`).
 
 ## Evidence ledger
 
 | Ladder rung | Status | Evidence |
 |---|---|---|
 | Suspected vulnerability | YES | patch diff + fault sites above |
-| Reproducible crash | NO | nothing run yet |
+| Accounting violation observed (protocol window over-committed past 2^31-1) | YES | gdb memory read: post-credit `send_window + queued` = 2,148,311,039 > MAX; .9 rejects the same WU at 2,145,689,599 (`send_window + send_queued`) |
+| Reproducible crash | NO | no fault in any run; worker stayed healthy through 3 runs/build |
 | Confirmed memory corruption | NO | — |
 | Demonstrated security impact | NO | — |
 
 Negative results preserved: toolchain smoke (previous wake), the refutation of
-the refund-inflation narrative above, and the un-verified upstream-commit
-cross-check.
+the refund-inflation narrative above, the three falsified queueing models in
+"Falsified models", and the un-verified upstream-commit cross-check.
